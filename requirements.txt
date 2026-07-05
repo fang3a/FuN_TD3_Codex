@@ -1,0 +1,11 @@
+numpy==1.23.5
+pandas==2.0.3
+scipy
+matplotlib
+networkx
+pandapower==2.14.10
+pandapipes==0.10.0
+torch==1.12.1
+tensorboard
+protobuf<=3.20.3
+gymnasium

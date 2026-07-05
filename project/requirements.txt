@@ -1,0 +1,8 @@
+# Tested with conda env python_3_8:
+# pandapower 2.14.10, pandapipes 0.10.0, numpy 1.23.5, pandas 2.0.3
+pandapower>=2.14,<3.4
+pandapipes>=0.10,<0.15
+numpy>=1.23
+pandas>=2.0
+pytest>=8.0
+gymnasium>=0.29; python_version >= "3.9"
