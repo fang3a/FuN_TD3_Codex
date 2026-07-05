@@ -24,6 +24,12 @@ Short debug training:
 
 from __future__ import annotations
 
+# =============================================================================
+# 中文详注版说明：仅增加注释，不修改任何可执行语句、变量名、默认参数或控制流。
+# 阅读时优先关注时间尺度边界、raw/executed 动作、聚合折扣和目标网络更新。
+# =============================================================================
+
+
 import argparse
 import copy
 import csv
@@ -84,6 +90,7 @@ GOAL_DIM = GOAL_SHARED_DIM + GOAL_SLOW_DIM + GOAL_FAST_DIM + GOAL_PHYSICAL_DIM
 # =============================================================================
 
 
+# 【中文导读】集中保存三层时间尺度、TD3、奖励塑形、探索、日志和阶段训练参数；gamma_slow/gamma_manager由快速步折扣指数换算。
 @dataclass
 class TrainConfig:
     """训练超参数集合。
@@ -187,6 +194,7 @@ class TrainConfig:
 # =============================================================================
 
 
+# 【中文导读】统一固定 Python、NumPy 和 PyTorch 随机源，便于复现实验。
 def set_seed(seed: int) -> None:
     """固定随机种子，减少重复实验之间的随机差异。"""
 
@@ -197,26 +205,31 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+# 【中文导读】把 auto/cpu/cuda 配置解析为 PyTorch 设备。
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(name)
 
 
+# 【中文导读】完整复制在线网络到目标网络，通常仅在初始化或只加载策略时使用。
 def hard_update(target: nn.Module, source: nn.Module) -> None:
     target.load_state_dict(source.state_dict())
 
 
+# 【中文导读】执行 Polyak 平均，使目标网络缓慢跟随在线网络以稳定 TD 目标。
 def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     with torch.no_grad():
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.mul_(1.0 - tau).add_(source_param.data, alpha=tau)
 
 
+# 【中文导读】限制梯度范数，防止大尺度奖励造成梯度爆炸。
 def clip_grad(parameters: Any, max_norm: float) -> None:
     nn.utils.clip_grad_norm_(list(parameters), max_norm)
 
 
+# 【中文导读】临时冻结或解冻模块，控制辅助损失的梯度路径。
 def set_requires_grad(module: Optional[nn.Module], enabled: bool) -> None:
     if module is None:
         return
@@ -224,6 +237,7 @@ def set_requires_grad(module: Optional[nn.Module], enabled: bool) -> None:
         param.requires_grad_(enabled)
 
 
+# 【中文导读】checkpoint 跨设备加载后迁移优化器动量状态。
 def move_optimizer_state(optimizer: optim.Optimizer, device: torch.device) -> None:
     """加载checkpoint后把Adam等优化器内部状态移动到当前训练设备。"""
     for state in optimizer.state.values():
@@ -232,10 +246,12 @@ def move_optimizer_state(optimizer: optim.Optimizer, device: torch.device) -> No
                 state[key] = value.to(device)
 
 
+# 【中文导读】统一把 NumPy float 数组放到训练设备。
 def to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
     return torch.as_tensor(array, dtype=torch.float32, device=device)
 
 
+# 【中文导读】将三段方向 goal 分别单位化，并将物理参考压到 [-1,1]。
 def normalize_goal_tensor(goal: torch.Tensor) -> torch.Tensor:
     """Manager goal = three L2-normalized directions plus tanh physical references."""
     shared = F.normalize(goal[..., 0:8], p=2, dim=-1, eps=1e-8)
@@ -245,6 +261,7 @@ def normalize_goal_tensor(goal: torch.Tensor) -> torch.Tensor:
     return torch.cat([shared, slow, fast, physical], dim=-1)
 
 
+# 【中文导读】交互阶段的 NumPy goal 归一化，与网络端规则保持一致。
 def normalize_goal_np(goal: np.ndarray) -> np.ndarray:
     """NumPy 版本的 goal 归一化，用于环境交互时处理单个 goal。"""
 
@@ -261,6 +278,7 @@ def normalize_goal_np(goal: np.ndarray) -> np.ndarray:
     return g.astype(np.float32)
 
 
+# 【中文导读】Slow/Fast Worker 从 32 维完整 goal 中提取 shared、private、physical 共 24 维条件。
 def worker_goal_np(goal: np.ndarray, role: str) -> np.ndarray:
     """Worker receives g_shared, its private goal and g_physical."""
     g = np.asarray(goal, dtype=np.float32)
@@ -271,6 +289,7 @@ def worker_goal_np(goal: np.ndarray, role: str) -> np.ndarray:
     raise ValueError(f"Unknown worker role: {role}")
 
 
+# 【中文导读】批量张量版本的 Worker goal 切片。
 def worker_goal_tensor(goal: torch.Tensor, role: str) -> torch.Tensor:
     if role == "slow":
         return torch.cat([goal[..., 0:8], goal[..., 8:16], goal[..., 24:32]], dim=-1)
@@ -279,6 +298,7 @@ def worker_goal_tensor(goal: torch.Tensor, role: str) -> torch.Tensor:
     raise ValueError(f"Unknown worker role: {role}")
 
 
+# 【中文导读】把 8 维 shared/private 方向组合后平铺到 Worker latent 维度，用于余弦方向奖励。
 def expanded_goal_direction_np(goal: np.ndarray, role: str, latent_dim: int) -> np.ndarray:
     """把8维方向目标平铺到Worker隐空间，避免维度不匹配。"""
     g = np.asarray(goal, dtype=np.float32)
@@ -294,6 +314,7 @@ def expanded_goal_direction_np(goal: np.ndarray, role: str, latent_dim: int) -> 
     return (tiled / max(tiled_norm, 1e-8)).astype(np.float32)
 
 
+# 【中文导读】批量张量版本的 latent 目标方向构造。
 def expanded_goal_direction_tensor(goal: torch.Tensor, role: str, latent_dim: int) -> torch.Tensor:
     role_part = goal[..., 8:16] if role == "slow" else goal[..., 16:24]
     direction = 0.5 * (goal[..., 0:8] + role_part)
@@ -303,6 +324,7 @@ def expanded_goal_direction_tensor(goal: torch.Tensor, role: str, latent_dim: in
     return F.normalize(tiled, p=2, dim=-1, eps=1e-8)
 
 
+# 【中文导读】在线维护观测均值和方差；训练时更新，评估时冻结。
 class RunningMeanStd:
     """在线观测归一化器；评估时可冻结统计量。"""
 
@@ -356,6 +378,7 @@ class RunningMeanStd:
         self.training = True
 
 
+# 【中文导读】将 episode 级回报、约束、投影与求解器指标写入 CSV。
 class EpisodeCSVLogger:
     """轻量训练日志；TensorBoard不可用时也能追踪每个episode。"""
 
@@ -399,6 +422,7 @@ class EpisodeCSVLogger:
 # =============================================================================
 
 
+# 【中文导读】从环境全局状态构造 Manager、快 Worker、慢 Worker 的任务相关观测。
 class ObservationBuilder:
     """从环境读取多层状态，并补充训练所需的少量上下文。"""
 
@@ -406,11 +430,13 @@ class ObservationBuilder:
         self.env = env
         self.manager_interval = manager_interval
 
+    # 【中文导读】返回 Manager 使用的全局电—气状态。
     def manager_obs(self, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
         if hasattr(self.env, "get_manager_state"):
             return np.asarray(self.env.get_manager_state(), dtype=np.float32)
         return np.asarray(fallback_global, dtype=np.float32)
 
+    # 【中文导读】构造以电侧为主、补充时间、SOC、慢设备设定和 goal 年龄的快观测。
     def fast_obs(self, manager_age_steps: int, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
         global_obs = np.asarray(fallback_global if fallback_global is not None else self.env.get_global_state(),
                                 dtype=np.float32)
@@ -430,6 +456,7 @@ class ObservationBuilder:
                 extras.append(np.asarray(slow.get(key, []), dtype=np.float32).reshape(-1))
         return np.nan_to_num(np.concatenate([base] + extras).astype(np.float32), nan=0.0)
 
+    # 【中文导读】构造以储能和气网为主、补充预测时间特征的慢观测。
     def slow_obs(self, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
         global_obs = np.asarray(fallback_global if fallback_global is not None else self.env.get_global_state(),
                                 dtype=np.float32)
@@ -447,6 +474,7 @@ class ObservationBuilder:
 # =============================================================================
 
 
+# 【中文导读】保存每个 3 分钟步的状态、raw/executed 动作、分项奖励、goal 与终止标志。
 class FastReplayBuffer:
     """快 Worker 的经验池。
 
@@ -513,6 +541,7 @@ class FastReplayBuffer:
         return self.capacity if self.full else self.idx
 
 
+# 【中文导读】保存跨多个快速步的慢时间尺度 SMDP 片段及 duration_steps。
 class SlowReplayBuffer:
     """慢 Worker 的经验池。
 
@@ -570,6 +599,7 @@ class SlowReplayBuffer:
         return self.capacity if self.full else self.idx
 
 
+# 【中文导读】保存一个 Manager goal 持续区间的全局起止状态和折扣外在回报。
 class ManagerReplayBuffer:
     """Manager 的经验池。
 
@@ -622,6 +652,7 @@ class ManagerReplayBuffer:
 # =============================================================================
 
 
+# 【中文导读】构造 Actor/Critic/Encoder 共用的两层 MLP。
 def make_mlp(input_dim: int, output_dim: int, hidden_dim: int, layer_norm: bool = True,
              output_activation: Optional[nn.Module] = None) -> nn.Sequential:
     """构造一个两层隐藏层 MLP，本文件所有 Actor/Critic/Encoder 共用。"""
@@ -638,6 +669,7 @@ def make_mlp(input_dim: int, output_dim: int, hidden_dim: int, layer_norm: bool 
     return nn.Sequential(*layers)
 
 
+# 【中文导读】把高维物理观测编码为 latent state。
 class MLPEncoder(nn.Module):
     """把原始观测压缩成 latent state。
 
@@ -653,6 +685,7 @@ class MLPEncoder(nn.Module):
         return self.net(obs)
 
 
+# 【中文导读】根据 Manager latent state 生成 32 维组合式 goal。
 class ManagerActor(nn.Module):
     """Manager Actor：输入 latent state，输出 32 维 goal。"""
 
@@ -664,6 +697,7 @@ class ManagerActor(nn.Module):
         return normalize_goal_tensor(self.net(z))
 
 
+# 【中文导读】双 Q 网络，估计全局 latent state 与 goal 的长期价值。
 class ManagerCritic(nn.Module):
     """Manager Critic：估计在当前 latent state 下给出某个 goal 的价值。"""
 
@@ -681,6 +715,7 @@ class ManagerCritic(nn.Module):
         return torch.minimum(q1, q2)
 
 
+# 【中文导读】根据 Worker latent state 和 24 维局部 goal 输出归一化控制动作。
 class WorkerActor(nn.Module):
     """Worker Actor：输入自己的 latent state 和 Manager goal，输出归一化动作。"""
 
@@ -692,6 +727,7 @@ class WorkerActor(nn.Module):
         return torch.tanh(self.net(torch.cat([z, worker_goal], dim=-1)))
 
 
+# 【中文导读】双 Q 网络，估计状态、goal、实际执行动作的价值。
 class WorkerCritic(nn.Module):
     """Worker Critic：估计状态、goal 与实际执行动作的 Q 值。"""
 
@@ -711,6 +747,7 @@ class WorkerCritic(nn.Module):
         return torch.minimum(q1, q2)
 
 
+# 【中文导读】可选隐空间动力学模型，预测动作导致的 latent 增量。
 class TransitionModel(nn.Module):
     """可选的隐空间动力学模型，预测 action 导致的 latent delta。"""
 
@@ -727,6 +764,7 @@ class TransitionModel(nn.Module):
 # =============================================================================
 
 
+# 【中文导读】高层 TD3；动作是 goal，样本是约两小时的聚合片段。
 class ManagerTD3:
     """Manager 层 TD3。
 
@@ -734,6 +772,7 @@ class ManagerTD3:
     Critic 学的是一个 Manager 时间段内累计出来的回报。
     """
 
+    # 【中文导读】创建在线/目标 Encoder、Actor、双 Critic，并完成硬同步和优化器初始化。
     def __init__(self, obs_dim: int, cfg: TrainConfig, device: torch.device):
         self.obs_dim = obs_dim
         self.cfg = cfg
@@ -753,6 +792,7 @@ class ManagerTD3:
         self.normalizer = RunningMeanStd((obs_dim,))
         self.total_updates = 0
 
+    # 【中文导读】归一化全局观测，生成 goal，叠加探索噪声，并与上一 goal 平滑。
     def select_goal(self, obs: np.ndarray, previous_goal: Optional[np.ndarray], noise_std: float,
                     deterministic: bool = False) -> np.ndarray:
         """根据 Manager 观测选择 goal；训练时加探索噪声，评估时 deterministic。"""
@@ -771,6 +811,7 @@ class ManagerTD3:
             goal = normalize_goal_np(smoothed)
         return goal.astype(np.float32)
 
+    # 【中文导读】用 Manager 聚合样本执行双 Critic 回归、延迟 Actor 更新和目标网络软更新。
     def update(self, buffer: ManagerReplayBuffer, batch_size: int) -> Dict[str, float]:
         if len(buffer) < batch_size:
             return {}
@@ -831,6 +872,7 @@ class ManagerTD3:
             "manager/q_value": float(torch.minimum(q1, q2).mean().detach().cpu()),
         }
 
+    # 【中文导读】序列化完整高层训练状态。
     def state_dict(self) -> Dict[str, Any]:
         return {
             "encoder": self.encoder.state_dict(),
@@ -846,6 +888,7 @@ class ManagerTD3:
             "total_updates": self.total_updates,
         }
 
+    # 【中文导读】恢复高层网络、优化器、归一化器和更新计数。
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         self.encoder.load_state_dict(state["encoder"])
         self.target_encoder.load_state_dict(state["target_encoder"])
@@ -863,6 +906,7 @@ class ManagerTD3:
         self.total_updates = int(state.get("total_updates", 0))
 
 
+# 【中文导读】Slow/Fast 共用 TD3；Critic 学执行动作，Actor 生成归一化请求动作。
 class WorkerTD3:
     """快/慢 Worker 共用的 TD3 实现。
 
@@ -870,6 +914,7 @@ class WorkerTD3:
     ESS、GFG、P2G、压缩机设定。二者网络结构相同，观测维度、动作维度和折扣因子不同。
     """
 
+    # 【中文导读】创建 Worker 在线/目标网络及可选隐空间动力学模型。
     def __init__(self, role: str, obs_dim: int, action_dim: int, latent_dim: int,
                  lr: float, cfg: TrainConfig, device: torch.device):
         self.role = role
@@ -895,6 +940,7 @@ class WorkerTD3:
         self.normalizer = RunningMeanStd((obs_dim,))
         self.total_updates = 0
 
+    # 【中文导读】把局部观测与角色相关 goal 输入 Actor，并叠加探索噪声。
     def select_action(self, obs: np.ndarray, goal: np.ndarray, noise_std: float,
                       deterministic: bool = False) -> np.ndarray:
         """Worker 根据自己的局部观测和 Manager goal 输出 [-1, 1] 动作。"""
@@ -909,6 +955,7 @@ class WorkerTD3:
             action += np.random.normal(0.0, noise_std, size=action.shape).astype(np.float32)
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
+    # 【中文导读】计算 latent 状态变化与 goal 方向的余弦相似度。
     def latent_goal_reward(self, obs: np.ndarray, next_obs: np.ndarray, goal: np.ndarray,
                            delta_z_min: float) -> float:
         """计算 FuN 风格的内在奖励：状态变化方向是否朝着 goal 指定方向前进。"""
@@ -928,12 +975,15 @@ class WorkerTD3:
             return 0.0
         return float(np.dot(delta_z, direction) / (delta_norm * direction_norm + 1e-8))
 
+    # 【中文导读】执行 Worker TD3、Encoder 辅助损失、可选 transition model 和延迟策略更新。
     def update(self, buffer: Any, batch_size: int, gamma: float) -> Dict[str, float]:
         if len(buffer) < batch_size:
             return {}
         data = buffer.sample(batch_size)
         obs = to_tensor(self.normalizer.normalize(data["obs"].cpu().numpy()), self.device)
         next_obs = to_tensor(self.normalizer.normalize(data["next_obs"].cpu().numpy()), self.device)
+        # Critic 回归使用环境真实执行动作，而不是 Actor 原始请求动作。
+        # actions: [batch_size, action_dim]；raw_actions 仅用于投影诊断/模仿损失。
         actions = data["executed_actions"]
         rewards = data["rewards"]
         dones = data["dones"]
@@ -952,6 +1002,8 @@ class WorkerTD3:
                 -self.cfg.target_noise_clip, self.cfg.target_noise_clip)
             next_actions = (next_actions + noise).clamp(-1.0, 1.0)
             q1_next, q2_next = self.target_critic(next_z, next_wg, next_actions)
+            # 半马尔可夫 TD 目标。Fast 使用 gamma_fast；Slow 当前传入固定 gamma_slow。
+            # 对提前结束的短片段，理论上更严谨的折扣应为 gamma_fast ** duration_steps。
             target_q = rewards + (1.0 - dones) * gamma * torch.minimum(q1_next, q2_next)
             if self.cfg.target_q_clip_abs > 0.0:
                 target_q = target_q.clamp(-self.cfg.target_q_clip_abs, self.cfg.target_q_clip_abs)
@@ -1002,6 +1054,7 @@ class WorkerTD3:
         if self.total_updates % self.cfg.policy_frequency == 0:
             # Actor 的目标是最大化 Critic 认为好的动作；代码里写成最小化 -Q。
             z_pi = self.encoder(obs).detach()
+            # Actor 输出仍是未经过环境安全投影的 raw action；因此需关注策略—执行动作偏差。
             actions_pi = self.actor(z_pi, wg)
             actor_loss = -self.critic.q_min(z_pi, wg, actions_pi).mean()
             if self.cfg.worker_action_l2_weight > 0.0:
@@ -1036,6 +1089,7 @@ class WorkerTD3:
             prefix + "q_value": float(torch.minimum(q1, q2).mean().detach().cpu()),
         }
 
+    # 【中文导读】序列化 Worker 完整训练状态。
     def state_dict(self) -> Dict[str, Any]:
         return {
             "role": self.role,
@@ -1054,6 +1108,7 @@ class WorkerTD3:
             "total_updates": self.total_updates,
         }
 
+    # 【中文导读】恢复 Worker 网络、优化器、归一化器和更新计数。
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         self.encoder.load_state_dict(state["encoder"])
         self.target_encoder.load_state_dict(state["target_encoder"])
@@ -1077,6 +1132,7 @@ class WorkerTD3:
         self.total_updates = int(state.get("total_updates", 0))
 
 
+# 【中文导读】把 Manager、Slow Worker、Fast Worker 作为一个整体传递和保存。
 @dataclass
 class AgentBundle:
     manager: ManagerTD3
@@ -1084,6 +1140,7 @@ class AgentBundle:
     fast: WorkerTD3
 
 
+# 【中文导读】按环境真实观测/动作维度构建三层智能体，并按阶段选择 Worker 学习率。
 def build_agents(env: ElectricGasMultiScaleEnv, cfg: TrainConfig, device: torch.device) -> AgentBundle:
     """按环境维度创建 Manager、慢 Worker、快 Worker。"""
 
@@ -1117,6 +1174,7 @@ SLOW_COMPONENTS = (
 )
 
 
+# 【中文导读】从环境成本字典中选取本 Worker 负责的物理成本并取负作为外在奖励。
 def external_reward_from_components(info: Dict[str, Any], keys: Tuple[str, ...]) -> float:
     """从环境 info 中抽取指定成本分量，并转成奖励符号。"""
 
@@ -1124,12 +1182,14 @@ def external_reward_from_components(info: Dict[str, Any], keys: Tuple[str, ...])
     return -float(sum(float(comps.get(k, 0.0)) for k in keys))
 
 
+# 【中文导读】根据 raw 与 executed 动作的均方距离惩罚不可行动作请求。
 def projection_penalty(raw_action: np.ndarray, executed_action: np.ndarray, scale: float) -> float:
     """安全投影越大，说明 Actor 越想做不可行动作，因此给负奖励。"""
 
     return -float(scale * np.mean(np.square(np.asarray(raw_action) - np.asarray(executed_action))))
 
 
+# 【中文导读】比较相邻快观测的电压偏差和线路过载，奖励物理状态改善。
 def fast_physical_progress(obs: np.ndarray, next_obs: np.ndarray, goal: np.ndarray) -> float:
     del goal
     if obs.size < 65 or next_obs.size < 65:
@@ -1141,6 +1201,7 @@ def fast_physical_progress(obs: np.ndarray, next_obs: np.ndarray, goal: np.ndarr
     return (voltage_now + line_now) - (voltage_next + line_next)
 
 
+# 【中文导读】比较 SOC 参考跟踪和气压越界程度，奖励慢设备带来的改善。
 def slow_physical_progress(obs: np.ndarray, next_obs: np.ndarray, goal: np.ndarray) -> float:
     if obs.size < 29 or next_obs.size < 29:
         return 0.0
@@ -1153,6 +1214,7 @@ def slow_physical_progress(obs: np.ndarray, next_obs: np.ndarray, goal: np.ndarr
     return (soc_now + gas_now) - (soc_next + gas_next)
 
 
+# 【中文导读】按配置合并外在奖励、latent 方向奖励、物理进展和投影惩罚。
 def build_worker_reward(external: float, latent: float, physical: float, proj: float,
                         cfg: TrainConfig) -> float:
     """把 Worker 的外在奖励、内在奖励和安全投影惩罚合成单个标量。"""
@@ -1163,6 +1225,7 @@ def build_worker_reward(external: float, latent: float, physical: float, proj: f
             proj)
 
 
+# 【中文导读】裁剪极端奖励，限制少数求解失败样本对 Q 回归的支配。
 def clip_reward_value(value: float, clip_abs: float) -> Tuple[float, bool]:
     """限制写入ReplayBuffer的奖励幅度，避免少数灾难回报主导Critic。"""
     if clip_abs <= 0.0:
@@ -1171,6 +1234,7 @@ def clip_reward_value(value: float, clip_abs: float) -> Tuple[float, bool]:
     return clipped, bool(abs(clipped - float(value)) > 1e-9)
 
 
+# 【中文导读】按 episode 线性衰减探索噪声。
 def scheduled_noise(initial: float, minimum: float, episode: int, decay_episodes: int) -> float:
     """线性退火探索噪声；长训后期减少由噪声造成的动作尖峰。"""
     if decay_episodes <= 0:
@@ -1184,6 +1248,7 @@ def scheduled_noise(initial: float, minimum: float, episode: int, decay_episodes
 # =============================================================================
 
 
+# 【中文导读】把物理压缩比反映射到 [-1,1] 动作空间。
 def normalized_compressor_ratio(env: ElectricGasMultiScaleEnv, index: int, ratio: float) -> float:
     from electric_gas_microgrid_single import COMPRESSOR_CONFIGS
     c = COMPRESSOR_CONFIGS[index]
@@ -1191,6 +1256,7 @@ def normalized_compressor_ratio(env: ElectricGasMultiScaleEnv, index: int, ratio
     return float(np.clip(2.0 * (ratio - c.min_pressure_ratio) / span - 1.0, -1.0, 1.0))
 
 
+# 【中文导读】计算慢动作保持期间仍满足 SOC 边界的 ESS 归一化功率上下限。
 def ess_normalized_power_bounds(env: ElectricGasMultiScaleEnv, horizon_steps: int) -> Tuple[np.ndarray, np.ndarray]:
     """Return normalized ESS action bounds that remain feasible over a hold horizon."""
     from electric_gas_microgrid_single import ESS_CONFIGS
@@ -1214,6 +1280,7 @@ def ess_normalized_power_bounds(env: ElectricGasMultiScaleEnv, horizon_steps: in
     return np.asarray(lower, dtype=np.float32), np.asarray(upper, dtype=np.float32)
 
 
+# 【中文导读】在进入环境前对 ESS 动作做跨保持区间的安全保护。
 def apply_ess_action_guard(env: ElectricGasMultiScaleEnv, slow_action: np.ndarray,
                            cfg: TrainConfig, horizon_steps: int) -> Tuple[np.ndarray, float]:
     """Clip ESS slow-action entries to SOC-feasible bounds before they reach the environment."""
@@ -1227,6 +1294,7 @@ def apply_ess_action_guard(env: ElectricGasMultiScaleEnv, slow_action: np.ndarra
     return action, float(np.linalg.norm(before - action[:env.n_ess]))
 
 
+# 【中文导读】Fast Worker 预训练时提供固定慢设备基线控制。
 def rule_slow_action(env: ElectricGasMultiScaleEnv) -> np.ndarray:
     from electric_gas_microgrid_single import COMPRESSOR_CONFIGS
     action = np.zeros(env.slow_action_dim, dtype=np.float32)
@@ -1242,6 +1310,7 @@ def rule_slow_action(env: ElectricGasMultiScaleEnv) -> np.ndarray:
     return action
 
 
+# 【中文导读】Worker 预训练时提供固定且合法的组合式 goal。
 def fixed_manager_goal() -> np.ndarray:
     goal = np.zeros(GOAL_DIM, dtype=np.float32)
     goal[0] = 1.0
@@ -1251,6 +1320,7 @@ def fixed_manager_goal() -> np.ndarray:
     return normalize_goal_np(goal)
 
 
+# 【中文导读】决定当前阶段哪些智能体执行参数更新。
 def stage_flags(stage: str) -> Dict[str, bool]:
     if stage == "fast_pretrain":
         return {"manager": False, "slow": False, "fast": True}
@@ -1265,6 +1335,7 @@ def stage_flags(stage: str) -> Dict[str, bool]:
     raise ValueError(f"Unknown training stage: {stage}")
 
 
+# 【中文导读】把环境异常转换为带失败惩罚的 truncated transition，避免训练进程直接退出。
 def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: np.ndarray
                   ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
     try:
@@ -1291,6 +1362,7 @@ def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: n
 # =============================================================================
 
 
+# 【中文导读】保存三层在线/目标网络、优化器、归一化器与训练元数据。
 def save_checkpoint(path: Path, cfg: TrainConfig, agents: AgentBundle, episode: int,
                     global_step: int, best_return: float) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1306,6 +1378,7 @@ def save_checkpoint(path: Path, cfg: TrainConfig, agents: AgentBundle, episode: 
     torch.save(payload, str(path))
 
 
+# 【中文导读】只加载 Encoder、Actor、归一化器等策略相关状态并重置目标网络。
 def load_agent_policy_state(agent: Any, state: Dict[str, Any]) -> None:
     agent.encoder.load_state_dict(state["encoder"])
     agent.actor.load_state_dict(state["actor"])
@@ -1319,6 +1392,7 @@ def load_agent_policy_state(agent: Any, state: Dict[str, Any]) -> None:
     agent.total_updates = 0
 
 
+# 【中文导读】按完整恢复或仅策略恢复两种模式载入 checkpoint。
 def load_checkpoint(path: str, agents: AgentBundle, map_location: torch.device,
                     policy_only: bool = False) -> Dict[str, Any]:
     payload = torch.load(path, map_location=map_location)
@@ -1333,6 +1407,7 @@ def load_checkpoint(path: str, agents: AgentBundle, map_location: torch.device,
     return payload
 
 
+# 【中文导读】在评估回报刷新时保存命名不同但内容完整的 checkpoint。
 def save_best_files(root: Path, agents: AgentBundle, cfg: TrainConfig, episode: int,
                     global_step: int, best_return: float) -> None:
     save_checkpoint(root / "latest_checkpoint.pt", cfg, agents, episode, global_step, best_return)
@@ -1346,6 +1421,7 @@ def save_best_files(root: Path, agents: AgentBundle, cfg: TrainConfig, episode: 
 # =============================================================================
 
 
+# 【中文导读】暂存刚执行的快动作，等待下一快观测后计算内在奖励并入库。
 @dataclass
 class PendingFastTransition:
     """尚未入库的快步样本。
@@ -1362,6 +1438,7 @@ class PendingFastTransition:
     done: bool
 
 
+# 【中文导读】累计一个慢动作保持区间内的折扣奖励、投影惩罚和持续步数。
 @dataclass
 class PendingSlowSegment:
     """慢动作片段缓存。
@@ -1378,6 +1455,7 @@ class PendingSlowSegment:
     duration_steps: int = 0
 
 
+# 【中文导读】累计一个 Manager goal 区间内的环境回报和持续步数。
 @dataclass
 class PendingManagerSegment:
     """Manager 片段缓存，记录一个 goal 持续期间累计到的环境回报。"""
@@ -1388,6 +1466,7 @@ class PendingManagerSegment:
     duration_steps: int = 0
 
 
+# 【中文导读】补齐快 transition 的 next_obs、next_goal 和内在奖励后写入经验池。
 def finalize_fast_transition(pending: PendingFastTransition, next_obs: np.ndarray, next_goal: np.ndarray,
                              fast_agent: WorkerTD3, buffer: FastReplayBuffer, cfg: TrainConfig) -> Dict[str, float]:
     """补齐 next_obs/内在奖励后，把快 Worker transition 写入经验池。"""
@@ -1405,6 +1484,7 @@ def finalize_fast_transition(pending: PendingFastTransition, next_obs: np.ndarra
             "fast_reward_clipped": float(clipped), "projection": pending.projection}
 
 
+# 【中文导读】在慢动作切换或 episode 结束时封装慢时间尺度聚合样本。
 def finalize_slow_segment(pending: PendingSlowSegment, obs_end: np.ndarray, next_goal: np.ndarray,
                           slow_agent: WorkerTD3, buffer: SlowReplayBuffer, cfg: TrainConfig,
                           done: bool) -> Dict[str, float]:
@@ -1429,6 +1509,7 @@ def finalize_slow_segment(pending: PendingSlowSegment, obs_end: np.ndarray, next
             "slow_reward_clipped": float(clipped)}
 
 
+# 【中文导读】三层时钟驱动的主训练循环，负责交互、聚合、更新、评估和保存。
 def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     """主训练循环。
 
@@ -1622,6 +1703,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                     fast_obs, current_goal, fast_noise, deterministic=False)
 
             # 环境只接收一个完整动作向量：前 12 维慢动作保持，后 16 维快动作每步更新。
+            # 固定动作布局：[ESS(3), GFG(3), P2G(3), compressor(3), inverter-Q(8), curtailment(8)]。
             joint_action = np.concatenate([held_slow_action, fast_action]).astype(np.float32)
             next_global_obs, env_reward, terminated, truncated, info = safe_env_step(env, joint_action, global_obs)
             applied = np.asarray(info.get("applied_action", np.clip(joint_action, -1.0, 1.0)), dtype=np.float32)
@@ -1650,6 +1732,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 # 慢 Worker 的奖励跨多个快速步折扣累加，直到下一次慢动作或 episode 结束。
                 if info.get("slow_action_applied", False):
                     pending_slow.executed_action = applied[:env.slow_action_dim].copy()
+                # 片段内部按快速步折扣：R_seg = Σ gamma_fast^k * r_{t+k}。
                 pending_slow.discounted_reward += (cfg.gamma_fast ** pending_slow.duration_steps) * slow_external
                 pending_slow.projection_penalty_sum += (
                     cfg.gamma_fast ** pending_slow.duration_steps
@@ -1657,6 +1740,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 pending_slow.duration_steps += 1
             if pending_manager is not None:
                 # Manager 直接看环境总奖励，学习 goal 对未来一段时间总回报的影响。
+                # Manager 聚合完整环境回报；goal change penalty 已在片段初始化时一次性加入。
                 pending_manager.discounted_reward += (cfg.gamma_fast ** pending_manager.duration_steps) * float(env_reward)
                 pending_manager.duration_steps += 1
                 manager_return += float(env_reward)
@@ -1705,6 +1789,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
 
         # 5) episode 结束时，把还没入库的 pending 片段收尾。
         final_manager_obs = builder.manager_obs(global_obs)
+        # 这里传入的是近似 manager_age；异常提前截断时可能与真实 t-last_manager_step 不一致。
         final_fast_obs = builder.fast_obs(max(0, min(cfg.manager_interval, cfg.episode_steps)), global_obs)
         final_slow_obs = builder.slow_obs(global_obs)
         if current_goal is None:
@@ -1850,6 +1935,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     }
 
 
+# 【中文导读】冻结观测统计并关闭探索噪声，评估回报和电气约束指标。
 def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, max_steps: int = EPISODE_STEPS,
                     seed: int = 12345) -> Dict[str, float]:
     """无探索噪声评估策略。
@@ -1969,11 +2055,13 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
 # =============================================================================
 
 
+# 【中文导读】最小测试中检查训练日志是否为有限数。
 def assert_no_nan_tensor_dict(logs: Dict[str, float]) -> None:
     for key, value in logs.items():
         assert np.isfinite(value), f"{key} is not finite"
 
 
+# 【中文导读】执行维度、动作保护、经验池、更新、checkpoint 和短训练冒烟测试。
 def run_minimum_tests() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     LOGGER.info("Running minimum tests...")
@@ -2102,6 +2190,7 @@ def run_minimum_tests() -> None:
 # =============================================================================
 
 
+# 【中文导读】把命令行参数映射为 TrainConfig。
 def parse_args() -> TrainConfig:
     """把命令行参数转换成 TrainConfig。"""
 
@@ -2209,6 +2298,7 @@ def parse_args() -> TrainConfig:
     return cfg
 
 
+# 【中文导读】顺序执行 fast、slow、manager、joint 四个训练阶段并传递 checkpoint。
 def run_all_stages(cfg: TrainConfig) -> Dict[str, Any]:
     """按 fast -> slow -> manager -> joint 顺序训练，上一阶段checkpoint自动接到下一阶段。"""
     stages = ["fast_pretrain", "slow_pretrain", "manager_train", "joint_finetune"]
@@ -2241,6 +2331,7 @@ def run_all_stages(cfg: TrainConfig) -> Dict[str, Any]:
     return results
 
 
+# 【中文导读】命令行入口。
 def main() -> None:
     """命令行入口：可运行最小测试、四阶段训练或单阶段训练。"""
 
