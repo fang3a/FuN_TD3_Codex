@@ -3,6 +3,9 @@
 Examples:
     python scripts/visualize_training_results.py --logs runs/.../episode_log.csv --output-dir runs/visualizations/latest
     python scripts/visualize_training_results.py --logs path1.csv path2.csv --labels v2 continue --output-dir runs/visualizations/compare
+
+这个脚本不加载模型，也不运行环境；它只读取训练时写出的 episode_log.csv。
+用途是把回报、评估结果、动作投影、求解失败和稳定性指标画成图。
 """
 
 from __future__ import annotations
@@ -36,6 +39,8 @@ def safe_name(text: str) -> str:
 
 
 def resolve_log_path(path_text: str) -> Path:
+    """允许用户传入 CSV 文件或 run 目录；目录时自动找最新 episode_log.csv。"""
+
     path = Path(path_text)
     if path.is_file():
         return path
@@ -54,6 +59,8 @@ def auto_latest_logs(limit: int) -> List[Path]:
 
 
 def load_run(path: Path, label: Optional[str] = None) -> RunLog:
+    """读取单次训练日志，并把可数值化的列转换为 numeric。"""
+
     df = pd.read_csv(path)
     for col in df.columns:
         if col not in NUMERIC_EXCLUDE:
@@ -99,6 +106,8 @@ def last_value(df: pd.DataFrame, column: str) -> float:
 
 
 def summarize_run(run: RunLog) -> dict:
+    """提取单次训练最重要的末值/最优值，写入 summary.csv。"""
+
     df = run.data
     ret = series(df, "episode_return")
     eval_ret = series(df, "eval_return")
@@ -146,6 +155,8 @@ def annotate_empty(ax: plt.Axes, text: str) -> None:
 
 
 def plot_run_dashboard(run: RunLog, out_dir: Path, window: int) -> Path:
+    """为单个 run 生成 3x2 训练诊断面板。"""
+
     df = run.data
     fig, axes = plt.subplots(3, 2, figsize=(15, 12))
     fig.suptitle(f"Training dashboard: {run.label}", fontsize=15)
@@ -246,6 +257,8 @@ def plot_run_dashboard(run: RunLog, out_dir: Path, window: int) -> Path:
 
 
 def plot_comparison(runs: List[RunLog], out_dir: Path, window: int) -> Optional[Path]:
+    """多个 run 时生成对比图；只有一个 run 时返回 None。"""
+
     if len(runs) < 2:
         return None
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
@@ -333,6 +346,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """命令行入口：解析日志路径、生成 dashboard、对比图和 summary。"""
+
     args = parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

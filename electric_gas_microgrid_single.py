@@ -411,6 +411,8 @@ def calibration_warning_messages() -> Tuple[str, ...]:
 
 @dataclass(frozen=True)
 class DailyProfiles:
+    """一天内的外生曲线，长度比一天多一个慢动作间隔，方便读取下一小时预测。"""
+
     load_multiplier: np.ndarray
     gas_multiplier: np.ndarray
     renewable_available_mw: np.ndarray
@@ -419,22 +421,31 @@ class DailyProfiles:
 
 
 def _smooth_noise(rng: np.random.Generator, n: int, scale: float, window: int) -> np.ndarray:
+    """生成平滑噪声，避免负荷和风光每 3 分钟剧烈跳变。"""
+
     raw = rng.normal(0.0, scale, n + window)
     kernel = np.ones(window) / window
     return np.convolve(raw, kernel, mode="valid")[:n]
 
 
 def generate_daily_profiles(time_config: TimeConfig, seed: int | None = None) -> DailyProfiles:
+    """生成负荷、气负荷和新能源可用功率曲线。
+
+    这些曲线是外生扰动，智能体不能控制，只能根据观测和预测做调度。
+    """
+
     rng = np.random.default_rng(seed)
     horizon = time_config.steps_per_day
     n = horizon + time_config.slow_action_interval_steps + 1
     hours = (np.arange(n) * time_config.dt_hours) % 24.0
 
+    # 电负荷采用早晚双峰形状，再叠加平滑随机扰动。
     load = 0.58
     load += 0.28 * np.exp(-0.5 * ((hours - 8.5) / 2.6) ** 2)
     load += 0.42 * np.exp(-0.5 * ((hours - 19.0) / 3.0) ** 2)
     load_multiplier = np.clip(load + _smooth_noise(rng, n, 0.035, 7), 0.40, 1.25)
 
+    # 气负荷也采用早晚峰，但峰值时间和幅度略不同。
     gas = 0.55
     gas += 0.30 * np.exp(-0.5 * ((hours - 7.0) / 2.4) ** 2)
     gas += 0.34 * np.exp(-0.5 * ((hours - 18.5) / 3.0) ** 2)
@@ -443,11 +454,13 @@ def generate_daily_profiles(time_config: TimeConfig, seed: int | None = None) ->
     renewable_available_mw = np.zeros((n, len(RENEWABLE_CONFIGS)), dtype=float)
     for i, cfg in enumerate(RENEWABLE_CONFIGS):
         if cfg.kind == "pv":
+            # 光伏按日照曲线建模，中午最高，夜晚为 0。
             daylight = np.clip((hours - 5.5) / (19.5 - 5.5), 0.0, 1.0)
             solar = np.sin(np.pi * daylight)
             cloud = np.clip(_smooth_noise(rng, n, 0.18, 11), -0.45, 0.30)
             available = cfg.capacity_mw * np.clip(solar * (1.0 + cloud), 0.0, 1.0)
         else:
+            # 风电不按日照归零，使用较慢的日内波动加随机扰动。
             wind = 0.48 + 0.16 * np.sin(2 * np.pi * (hours - 2.0) / 24.0)
             available = cfg.capacity_mw * np.clip(wind + _smooth_noise(rng, n, 0.18, 13), 0.08, 1.0)
         renewable_available_mw[:, i] = available
@@ -463,6 +476,8 @@ def generate_daily_profiles(time_config: TimeConfig, seed: int | None = None) ->
 
 
 def profile_at(profiles: DailyProfiles, time_index: int) -> Dict[str, np.ndarray | float]:
+    """安全读取某个时间步的外生曲线，索引越界时自动夹到合法范围。"""
+
     idx = min(max(time_index, 0), len(profiles.load_multiplier) - 1)
     return {
         "load_multiplier": float(profiles.load_multiplier[idx]),
@@ -560,10 +575,13 @@ class GasNetworkArtifacts:
 
 
 def build_power_network(config: ProjectConfig | None = None) -> PowerNetworkArtifacts:
+    """构建 pandapower IEEE33 电网，并保存后续 step 需要修改的元件索引。"""
+
     cfg = config or DEFAULT_CONFIG
     import pandapower as pp
 
     net = pp.create_empty_network(sn_mva=cfg.power.base_mva)
+    # 母线和线路构成基础配电网；负荷/新能源/储能/耦合设备随后挂接上去。
     for bus in range(N_POWER_BUSES):
         pp.create_bus(net, vn_kv=cfg.power.base_kv, name=f"Bus_{bus}",
                       min_vm_pu=cfg.power.voltage_min_pu, max_vm_pu=cfg.power.voltage_max_pu)
@@ -605,6 +623,8 @@ def build_power_network(config: ProjectConfig | None = None) -> PowerNetworkArti
 
 
 def build_gas_network(config: ProjectConfig | None = None) -> GasNetworkArtifacts:
+    """构建 pandapipes Belgian20 气网，并保存 source/sink/压缩机索引。"""
+
     cfg = config or DEFAULT_CONFIG
     import pandapipes as pp
 
@@ -617,6 +637,7 @@ def build_gas_network(config: ProjectConfig | None = None) -> GasNetworkArtifact
         net = pp.create_empty_network()
         pp.create_fluid_from_lib(net, cfg.gas.fluid_name, overwrite=True)
 
+    # junction 是气网节点；显示名使用 1-based Gnode_1..20，内部仍是 0-based。
     for node in GAS_NODES:
         pp.create_junction(net, pn_bar=cfg.gas.source_pressure_bar, tfluid_k=cfg.gas.gas_temperature_k,
                            name=f"Gnode_{node.node + 1}")
@@ -625,6 +646,7 @@ def build_gas_network(config: ProjectConfig | None = None) -> GasNetworkArtifact
                                t_k=cfg.gas.gas_temperature_k, name=f"{s.name}_pressure_source"))
         for s in GAS_SUPPLIERS
     ]
+    # 管道参数是暂定等效值，主要保证第一版准稳态模型可求解。
     for pipe in GAS_PIPES:
         pp.create_pipe_from_parameters(net, pipe.from_junction, pipe.to_junction,
                                        length_km=pipe.length_km, diameter_m=pipe.diameter_m,
@@ -752,6 +774,9 @@ class ESSProjectionBatch:
 
 
 def project_ess_power(requested_p_mw: float, soc: float, ess: ESSConfig, dt_hours: float) -> ActionProjectionResult:
+    """把 ESS 请求功率投影到当前 SOC 可行区间。"""
+
+    # p_mw>0 为充电，p_mw<0 为放电；SOC 决定当前步还能充/放多少。
     max_charge_by_soc = (ess.soc_max - soc) * ess.capacity_mwh / (ess.eta_charge * dt_hours)
     min_discharge_by_soc = (ess.soc_min - soc) * ess.capacity_mwh * ess.eta_discharge / dt_hours
     lower = max(-ess.max_p_mw, min_discharge_by_soc)
@@ -765,6 +790,8 @@ def project_ess_power(requested_p_mw: float, soc: float, ess: ESSConfig, dt_hour
 
 
 def project_ess_batch(requested_p_mw: Sequence[float], soc: Sequence[float], dt_hours: float) -> ESSProjectionBatch:
+    """对所有 ESS 批量执行安全投影。"""
+
     results = [project_ess_power(float(p), float(s), ess, dt_hours)
                for p, s, ess in zip(requested_p_mw, soc, ESS_CONFIGS)]
     return ESSProjectionBatch(
@@ -776,6 +803,8 @@ def project_ess_batch(requested_p_mw: Sequence[float], soc: Sequence[float], dt_
 
 
 def update_ess_soc(soc: float, p_mw: float, ess: ESSConfig, dt_hours: float) -> float:
+    """根据实际执行功率更新 SOC。"""
+
     if p_mw >= 0.0:
         delta_e_mwh = ess.eta_charge * p_mw * dt_hours
     else:
@@ -795,6 +824,8 @@ class InverterProjection:
 
 
 def project_inverter_action(cfg: RenewableConfig, p_available_mw: float, requested_q_mvar: float, requested_curtailment: float) -> InverterProjection:
+    """投影新能源逆变器动作，满足削减边界和 P²+Q²<=S²。"""
+
     curtailment = float(np.clip(requested_curtailment, 0.0, cfg.max_curtailment))
     p_actual = max(0.0, p_available_mw) * (1.0 - curtailment)
     q_limit = float(np.sqrt(max(cfg.s_rated_mva ** 2 - p_actual ** 2, 0.0)))
@@ -825,6 +856,12 @@ class GasSolveDecision:
 
 
 class EventScheduler:
+    """决定当前快速步是否需要重新运行气网 pipeflow。
+
+    气网求解较慢，因此不是每 3 分钟都强制计算；只有首次、整点慢动作、
+    或 GFG/P2G/压缩机/气负荷变化超过阈值时才刷新。
+    """
+
     def __init__(self, time_config: TimeConfig, event_config: EventConfig):
         self.time_config = time_config
         self.event_config = event_config
@@ -835,6 +872,8 @@ class EventScheduler:
 
     def decide(self, time_index: int, gfg_mdot: np.ndarray, p2g_mdot: np.ndarray,
                comp_ratio: np.ndarray, gas_load_multiplier: float) -> GasSolveDecision:
+        """返回是否需要求解气网，以及触发原因字符串。"""
+
         if self.last_state is None:
             return GasSolveDecision(True, "initial")
         if time_index % self.time_config.slow_action_interval_steps == 0:
@@ -851,6 +890,8 @@ class EventScheduler:
         return GasSolveDecision(False, "hold_previous_gas_state")
 
     def mark_solved(self, gfg_mdot: np.ndarray, p2g_mdot: np.ndarray, comp_ratio: np.ndarray, gas_load_multiplier: float) -> None:
+        """记录最近一次 pipeflow 使用的驱动量。"""
+
         self.last_state = GasEventState(gfg_mdot.copy(), p2g_mdot.copy(), comp_ratio.copy(), float(gas_load_multiplier))
 
 
@@ -883,6 +924,12 @@ class CoupledSolveResult:
 
 
 class CoupledSolver:
+    """显式手工电-气耦合求解器。
+
+    它把慢/快动作写入 pandapower 和 pandapipes 网络表，然后按事件策略运行
+    气网 pipeflow，并每个快速步运行电网 powerflow。
+    """
+
     def __init__(self, power: PowerNetworkArtifacts, gas: GasNetworkArtifacts, config: ProjectConfig):
         self.power = power
         self.gas = gas
@@ -894,6 +941,8 @@ class CoupledSolver:
         self.last_compressor_mdot_kg_s = np.array([c.nominal_flow_kg_s for c in COMPRESSOR_CONFIGS], dtype=float)
 
     def reset(self) -> None:
+        """重置气网事件状态和上一轮压缩机流量估计。"""
+
         self.scheduler.reset()
         self.gas_state_age = 0
         self.gas_solve_count = 0
@@ -902,6 +951,9 @@ class CoupledSolver:
 
     def solve_step(self, time_index: int, profile: Dict[str, np.ndarray | float],
                    actions: PhysicalActions, force_gas: bool = False) -> CoupledSolveResult:
+        """执行一次 t 到 t+1 的准稳态耦合求解。"""
+
+        # 先把当前外生曲线和设备动作写入两张网络。
         self._write_power_profile_and_actions(profile, actions)
         gfg_mdot = self._write_gfg(actions.gfg_p_mw)
         p2g_mdot = self._write_p2g(actions.p2g_p_mw)
@@ -912,9 +964,11 @@ class CoupledSolver:
                                          actions.compressor_ratio, float(profile["gas_multiplier"]))
         gas_solved = force_gas or decision.should_solve
         gas_reason = "forced" if force_gas and not decision.should_solve else decision.reason
+        # 压缩机电功率依赖流量；气网未重算时沿用上一轮流量估计。
         comp_dispatches = self._write_compressor_power_loads(actions.compressor_ratio)
         gas_converged = self.last_gas_converged
         if gas_solved:
+            # 多迭代几次，让气网流量和压缩机电负荷相互刷新。
             for _ in range(self.config.safety.solver_iterations):
                 self._run_pipeflow()
                 gas_converged = True
@@ -926,14 +980,18 @@ class CoupledSolver:
             self.gas_state_age = 0
             self.gas_solve_count += 1
         else:
+            # 不求气网时保留上一轮结果，并记录已复用多少快速步。
             self.gas_state_age += 1
 
+        # 逆变器快动作每步都可能变，所以电网每 3 分钟都重算。
         self._run_powerflow()
         return CoupledSolveResult(True, gas_converged, gas_solved, gas_reason,
                                   self.gas_state_age, gfg_mdot, p2g_mdot,
                                   comp_dispatches, self.compute_equivalent_linepack_indicator())
 
     def _write_power_profile_and_actions(self, profile: Dict[str, np.ndarray | float], actions: PhysicalActions) -> None:
+        """把电负荷、新能源和 ESS 动作写入 pandapower 网络。"""
+
         net = self.power.net
         load_mult = float(profile["load_multiplier"])
         for i, (_, p_base, q_base) in enumerate(IEEE33_LOAD_DATA):
@@ -948,6 +1006,8 @@ class CoupledSolver:
             net.storage.at[idx, "q_mvar"] = 0.0
 
     def _write_gfg(self, requested_p_mw: Sequence[float]) -> np.ndarray:
+        """写入 GFG：电侧是 sgen，气侧是 sink。"""
+
         mdot = []
         for i, cfg in enumerate(GFG_CONFIGS):
             disp = dispatch_gfg(cfg, float(requested_p_mw[i]), self.config.gas.hhv_mj_per_kg)
@@ -958,6 +1018,8 @@ class CoupledSolver:
         return np.asarray(mdot, dtype=float)
 
     def _write_p2g(self, requested_p_mw: Sequence[float]) -> np.ndarray:
+        """写入 P2G：电侧是 load，气侧是 source。"""
+
         mdot = []
         for i, cfg in enumerate(P2G_CONFIGS):
             disp = dispatch_p2g(cfg, float(requested_p_mw[i]), self.config.gas.hhv_mj_per_kg)

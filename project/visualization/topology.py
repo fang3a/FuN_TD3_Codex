@@ -1,4 +1,8 @@
-"""Topology overview plot for the coupled electric-gas model."""
+"""Topology overview plot for the coupled electric-gas model.
+
+这张图用于理解“电网节点、气网节点和耦合设备在哪里”。它不参与训练，
+但能帮助初学者把 GFG、P2G、压缩机在两张网络中的连接关系看清楚。
+"""
 
 from __future__ import annotations
 
@@ -80,6 +84,8 @@ def save_coupled_topology_overview(
 
 
 def _power_positions() -> dict[int, tuple[float, float]]:
+    """手工给 IEEE33 节点排版，突出辐射型分支结构。"""
+
     pos: dict[int, tuple[float, float]] = {}
     for bus in range(18):
         pos[bus] = (float(bus) * 0.82, 0.0)
@@ -93,6 +99,8 @@ def _power_positions() -> dict[int, tuple[float, float]]:
 
 
 def _gas_positions() -> dict[int, tuple[float, float]]:
+    """手工给 Belgian20 节点排版，尽量减少边和耦合箭头重叠。"""
+
     raw = {
         0: (23.0, 2.2),
         1: (25.2, 3.0),
@@ -201,6 +209,8 @@ def _scatter_device(
 
 
 def _draw_couplings(ax, power_pos: Mapping[int, tuple[float, float]], gas_pos: Mapping[int, tuple[float, float]], patch_cls) -> None:
+    """画 GFG、P2G 和压缩机电负荷的跨网耦合箭头。"""
+
     for idx, gfg in enumerate(GFG_CONFIGS):
         _curved_arrow(
             ax,
