@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from project.visualization.topology import save_coupled_topology_overview
+from visualization.topology import save_coupled_topology_overview
 
 
 def main() -> None:

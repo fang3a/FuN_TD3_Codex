@@ -56,3 +56,26 @@ def test_save_coupled_topology_overview(tmp_path) -> None:
     path = save_coupled_topology_overview(tmp_path / "topology.png")
     assert path.exists()
     assert path.stat().st_size > 0
+
+
+def test_save_model_parameter_artifacts(tmp_path) -> None:
+    pytest.importorskip("matplotlib")
+    from project.visualization import save_model_parameter_artifacts
+
+    artifacts = save_model_parameter_artifacts(tmp_path, include_topology=False)
+    required = {
+        "parameter_summary_csv",
+        "device_parameters_csv",
+        "coupling_map_csv",
+        "completeness_csv",
+        "calibration_items_csv",
+        "summary_json",
+        "overview_dashboard",
+        "capacity_dashboard",
+        "constraint_reward_dashboard",
+        "report_md",
+    }
+    assert required.issubset(artifacts)
+    for key in required:
+        assert artifacts[key].exists()
+        assert artifacts[key].stat().st_size > 0

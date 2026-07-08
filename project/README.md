@@ -107,6 +107,21 @@ pandas 2.0.3
 
 ## 可视化输出
 
+静态建模参数可视化：
+
+```powershell
+& 'D:\anaconda\anaconda\envs\python_3_8\python.exe' -m project.plot_model_parameters --output-dir project/outputs/model_parameters
+```
+
+主要输出：
+
+- `model_parameter_dashboard.png`：网络规模、RL 接口维度、合理性指标和建模完成度。
+- `device_capacity_dashboard.png`：新能源、ESS、GFG、P2G、压缩机和气源/负荷容量。
+- `constraint_reward_dashboard.png`：电压/气压/SOC 约束、压缩机压力比和奖励权重。
+- `coupled_topology_overview.png`：电网-气网耦合拓扑总览。
+- `model_parameter_report.md`：面向汇报的建模合理性文字说明。
+- `*.csv` / `model_parameter_summary.json`：参数、设备、耦合映射、完成度和待校准项结构化数据。
+
 随机策略脚本默认生成一份 CSV 和两张图：
 
 ```powershell
