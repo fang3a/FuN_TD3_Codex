@@ -1805,6 +1805,7 @@ class ElectricGasMultiScaleEnv:
             attempted_applied_action = self.last_applied_action.copy()
             result = self.solver.solve_step(time_index, profile, physical)
             self.last_solve_result = result
+            # 更新压缩机压力比
             if result.compressor_dispatches:
                 applied_ratios = np.asarray(
                     [d.applied_pressure_ratio for d in result.compressor_dispatches], dtype=float
@@ -1853,17 +1854,18 @@ class ElectricGasMultiScaleEnv:
             # ESS 既有功率上限又有 SOC 上下限，所以先投影到当前步可行区间。
             self.last_slow_action = slow.copy()
             cursor = 0
-            requested_ess = np.array([slow[cursor + i] * ESS_CONFIGS[i].max_p_mw for i in range(self.n_ess)])
+            requested_ess = np.array([slow[cursor + i] * ESS_CONFIGS[i].max_p_mw for i in range(self.n_ess)])#求解ESS物理真实功率
             cursor += self.n_ess
             self.last_ess_projection = project_ess_batch(requested_ess, self.ess_soc, self.config.time.dt_hours)
-            self.last_physical_slow["ess_p_mw"] = self.last_ess_projection.applied_p_mw.copy()
+            #投影ESS功率，通过现有SOC量计算现在能充放电的功率
+            self.last_physical_slow["ess_p_mw"] = self.last_ess_projection.applied_p_mw.copy()#applied_p_mw是投影后实际执行的ESS功率
             self.last_physical_slow["gfg_p_mw"] = np.array([
                 0.5 * (slow[cursor + i] + 1.0) * GFG_CONFIGS[i].max_p_mw for i in range(self.n_gfg)
-            ])
+            ])#求解GFG物理真实功率
             cursor += self.n_gfg
             self.last_physical_slow["p2g_p_mw"] = np.array([
                 0.5 * (slow[cursor + i] + 1.0) * P2G_CONFIGS[i].max_p_mw for i in range(self.n_p2g)
-            ])
+            ])#求解P2G物理真实功率
             cursor += self.n_p2g
             ratios = default_compressor_ratios()
             for action_pos, comp_idx in enumerate(CONTROLLED_COMPRESSOR_INDICES):
@@ -2037,41 +2039,46 @@ class ElectricGasMultiScaleEnv:
         """
 
         dt_h = self.config.time.dt_hours
+        #_series_values函数获取power_net中名为res_bus的所有vm_pu数值，判断数据长度是否满足33个
         vm = self._series_values(self.power.net, "res_bus", "vm_pu", 33, 1.0)
         loading = self._series_values(self.power.net, "res_line", "loading_percent", len(IEEE33_LINE_DATA), 0.0)
         gas_p = self._series_values(self.gas.net, "res_junction", "p_bar", N_GAS_JUNCTIONS,
                                     self.config.gas.network_pressure_target_bar)
-        pipe_velocity = read_pipe_velocity_m_per_s(self.gas.net, len(GAS_PIPES))
-        source_mdot, source_sign = read_gas_source_mdot_kg_s(self.gas.net, self.gas)
-        source_caps = np.array([s.max_mdot_kg_s for s in GAS_SUPPLIERS], dtype=float)
-        source_capacity_violation = np.maximum(source_mdot - source_caps, 0.0)
-        gfg_inlet_pressures = read_gfg_inlet_pressures_bar(self.gas.net, self.config.gas.network_pressure_target_bar)
-        gfg_inlet_pressure_violation = np.maximum(self.config.gas.network_pressure_min_bar - gfg_inlet_pressures, 0.0)
-        voltage_deviation = float(np.sum(((vm - self.config.power.voltage_target_pu) / 0.05) ** 2))
+        pipe_velocity = read_pipe_velocity_m_per_s(self.gas.net, len(GAS_PIPES))#管道气体流速
+        source_mdot, source_sign = read_gas_source_mdot_kg_s(self.gas.net, self.gas)#气源气体流量单位为kg/s
+        source_caps = np.array([s.max_mdot_kg_s for s in GAS_SUPPLIERS], dtype=float)#气源最大流量单位为kg/s
+        source_capacity_violation = np.maximum(source_mdot - source_caps, 0.0)#气源流量超量
+        gfg_inlet_pressures = read_gfg_inlet_pressures_bar(self.gas.net, self.config.gas.network_pressure_target_bar)#GFG入口压力
+        gfg_inlet_pressure_violation = np.maximum(self.config.gas.network_pressure_min_bar - gfg_inlet_pressures, 0.0)#GFG入口压力超量
+        voltage_deviation = float(np.sum(((vm - self.config.power.voltage_target_pu) / 0.05) ** 2))#电压偏离度，33节点分别减去目标电压值
         voltage_violation = float(np.sum(np.maximum(self.config.power.voltage_min_pu - vm, 0.0) ** 2 +
-                                         np.maximum(vm - self.config.power.voltage_max_pu, 0.0) ** 2))
-        gas_pressure_deviation = float(np.nanmean((gas_p - self.config.gas.network_pressure_target_bar) ** 2))
+                                         np.maximum(vm - self.config.power.voltage_max_pu, 0.0) ** 2))#电压控制在安全区，安全区外才有惩罚
+        gas_pressure_deviation = float(np.nanmean((gas_p - self.config.gas.network_pressure_target_bar) ** 2))#气压偏离度
         gas_pressure_violation = float(np.nanmean(
             np.maximum(self.config.gas.network_pressure_min_bar - gas_p, 0.0) ** 2 +
             np.maximum(gas_p - self.config.gas.network_pressure_max_bar, 0.0) ** 2
-        ))
+        ))#气压控制在安全区，安全区外才有惩罚
         pipe_velocity_violation = float(np.nanmean(
             np.maximum(np.abs(pipe_velocity) - self.config.gas.max_pipe_velocity_m_per_s, 0.0) ** 2
-        ))
-        source_capacity_violation_cost_raw = float(np.sum(source_capacity_violation ** 2))
-        line_overload = float(np.sum(np.maximum(loading - self.config.power.max_line_loading_percent, 0.0) ** 2))
+        ))#管道气体流速控制在安全区，安全区外才有惩罚
+        source_capacity_violation_cost_raw = float(np.sum(source_capacity_violation ** 2))#气源容量
+        line_overload = float(np.sum(np.maximum(loading - self.config.power.max_line_loading_percent, 0.0) ** 2))#线路过载
+        #pl_mw为线路损失功率
         p_loss_mw = float(np.nansum(self._series_values(self.power.net, "res_line", "pl_mw", len(IEEE33_LINE_DATA), 0.0)))
-        grid_purchase_mwh = max(float(np.nansum(self._series_values(self.power.net, "res_ext_grid", "p_mw", 1, 0.0))), 0.0) * dt_h
+        grid_purchase_mwh = max(float(np.nansum(self._series_values(self.power.net, "res_ext_grid", "p_mw", 1, 0.0))), 0.0) * dt_h 
         gas_purchase_kg = float(np.nansum(np.maximum(source_mdot, 0.0))) * dt_h * 3600.0
         curtail_mwh = 0.0
+        # 计算新能源 curtailment 成本。
         if self.last_inverter_projection and self.profiles is not None:
             prof = profile_at(self.profiles, min(self.current_step, self.config.time.steps_per_day))
             avail = np.asarray(prof["renewable_available_mw"], dtype=float)
-            curtail_mwh = float(np.sum([avail[i] * p.curtailment * dt_h for i, p in enumerate(self.last_inverter_projection)]))
+            curtail_mwh = float(np.sum([avail[i] * p.curtailment * dt_h for i, p in enumerate(self.last_inverter_projection)]))#弃电成本
         comp_mwh = 0.0
         comp_dispatches = self.last_solve_result.compressor_dispatches if self.last_solve_result else []
+        # 计算压缩机运行成本。
         if self.last_solve_result:
-            comp_mwh = float(sum(d.electric_power_mw for d in comp_dispatches) * dt_h)
+            comp_mwh = float(sum(d.electric_power_mw for d in comp_dispatches) * dt_h)#只有压缩机电力成本参与奖励计算
+        #后续压缩机参数存入metric中皆用于调试
         comp_signed = np.asarray([d.signed_mdot_kg_s for d in comp_dispatches], dtype=float)
         comp_effective = np.asarray([d.effective_mdot_kg_s for d in comp_dispatches], dtype=float)
         comp_requested_ratio = np.asarray([d.requested_pressure_ratio for d in comp_dispatches], dtype=float)
@@ -2081,11 +2088,12 @@ class ElectricGasMultiScaleEnv:
         comp_bypassed = np.asarray([d.bypassed for d in comp_dispatches], dtype=bool)
         comp_power_limited = np.asarray([d.power_limited for d in comp_dispatches], dtype=bool)
         comp_projection = np.asarray([d.ratio_projection_magnitude for d in comp_dispatches], dtype=float)
+        # 计算ESS运行成本，当前物理状态与上一时间步的输入功率的差值，计算运行成本
         ess_change = float(np.sum(np.abs(self.last_physical_slow["ess_p_mw"] - self.previous_device_actions["ess_p_mw"])))
         gfg_change = float(np.sum(np.abs(self.last_physical_slow["gfg_p_mw"] - self.previous_device_actions["gfg_p_mw"])))
         p2g_change = float(np.sum(np.abs(self.last_physical_slow["p2g_p_mw"] - self.previous_device_actions["p2g_p_mw"])))
         soc_soft = float(np.sum(np.maximum(self.config.safety.soc_soft_low - self.ess_soc, 0.0) ** 2 +
-                                np.maximum(self.ess_soc - self.config.safety.soc_soft_high, 0.0) ** 2))
+                                np.maximum(self.ess_soc - self.config.safety.soc_soft_high, 0.0) ** 2))#ESS状态软约束
         terminal_soc = 0.0
         if self.current_step >= self.config.time.steps_per_day:
             terminal_soc = float(np.sum((self.ess_soc - np.array([e.soc_initial for e in ESS_CONFIGS])) ** 2))
@@ -2191,7 +2199,7 @@ class ElectricGasMultiScaleEnv:
         table = getattr(net, table_name)
         if column not in table:
             return np.full(length, default, dtype=float)
-        values = np.asarray(table[column].values, dtype=float)
+        values = np.asarray(table[column].values, dtype=float)#得到了net网络中名为table_name的所有column数值
         if values.size < length:
             values = np.pad(values, (0, length - values.size), constant_values=default)
         return values[:length]
