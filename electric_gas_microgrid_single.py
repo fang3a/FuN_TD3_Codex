@@ -178,8 +178,8 @@ class EventConfig:
 class RewardConfig:
     """奖励权重。代码中先计算成本，再用 reward = -sum(cost)。"""
 
-    voltage_deviation: float = 25.0 #电压偏差权重
-    voltage_violation: float = 500.0 #电压违规权重
+    voltage_deviation: float = 2.0 #由三种子诊断校准，使电压与气压偏差累计成本同量级
+    voltage_violation: float = 100000.0 #使观测到的越限步惩罚高于一般软成本
     gas_pressure_deviation: float = 25.0
     gas_pressure_violation: float = 500.0
     pipe_velocity_violation: float = 50.0
@@ -188,7 +188,7 @@ class RewardConfig:
     power_loss: float = 20.0 #功率损失权重
     grid_energy_price: float = 0.0 #电网电价权重
     gas_price: float = 0.0 #燃气电价权重
-    renewable_curtailment: float = 40.0
+    renewable_curtailment: float = 400.0
     ess_action_change: float = 0.5 #储能动作变化权重
     gfg_action_change: float = 1.0 #燃气发电机动作变化权重
     p2g_action_change: float = 1.0 #电转气设备动作变化权重
@@ -1830,6 +1830,11 @@ class ElectricGasMultiScaleEnv:
             terminated = self.current_step >= self.config.time.steps_per_day
             truncated = False
         except Exception as exc:
+            # Preserve traceback for programming/API failures. Numerical
+            # solver exceptions continue through the rollback path below.
+            if isinstance(exc, (AssertionError, AttributeError, IndexError, KeyError, TypeError)):
+                self._restore_snapshot(snapshot)
+                raise
             # 回滚后仍推进一步并给失败惩罚，避免训练在同一个坏状态无限循环。
             self._restore_snapshot(snapshot)
             self.last_raw_action = action.copy()
@@ -2029,6 +2034,119 @@ class ElectricGasMultiScaleEnv:
     def get_slow_worker_state(self) -> np.ndarray:
         start = 33 + len(IEEE33_LINE_DATA) + 5 + 3 * self.n_renew
         return self.get_global_state()[start:].copy()
+
+    def get_slow_safety_features(self) -> Dict[str, np.ndarray]:
+        """Return a compact, read-only electric-gas safety state for the Slow Worker.
+
+        The mapping keys are consumed by the centralized layout in the training
+        module.  This method deliberately performs no projection, dispatch, SOC
+        update or solver call, so exposing these diagnostics cannot alter the
+        physical transition model.
+        """
+
+        if self.profiles is None:
+            raise RuntimeError("Slow safety features require reset() to initialize daily profiles")
+        t = min(self.current_step, self.config.time.steps_per_day)
+        current = profile_at(self.profiles, t)
+        next_slow = profile_at(self.profiles, t + self.config.time.slow_action_interval_steps)
+        vm = self._series_values(self.power.net, "res_bus", "vm_pu", 33, 1.0)
+        loading = self._series_values(
+            self.power.net, "res_line", "loading_percent", len(IEEE33_LINE_DATA), 0.0
+        )
+        ext_p = self._series_values(self.power.net, "res_ext_grid", "p_mw", 1, 0.0)
+        renewable_available = np.asarray(current["renewable_available_mw"], dtype=float)
+        renewable_actual = np.asarray(
+            [item.p_actual_mw for item in self.last_inverter_projection] or np.zeros(self.n_renew),
+            dtype=float,
+        )
+        total_base_load_mw = float(sum(item[1] for item in IEEE33_LOAD_DATA))
+        load_scale = max(total_base_load_mw, 1e-6)
+        available_total = float(np.sum(renewable_available))
+        actual_total = float(np.sum(renewable_actual))
+        curtailment_rate = max(available_total - actual_total, 0.0) / max(available_total, 1e-6)
+
+        gas_pressure = self._series_values(
+            self.gas.net, "res_junction", "p_bar", N_GAS_JUNCTIONS,
+            self.config.gas.network_pressure_target_bar,
+        )
+        pressure_deviation = gas_pressure - self.config.gas.network_pressure_target_bar
+        pipe_velocity = read_pipe_velocity_m_per_s(self.gas.net, len(GAS_PIPES))
+        source_mdot, _ = read_gas_source_mdot_kg_s(self.gas.net, self.gas)
+        source_capacity = np.asarray([item.max_mdot_kg_s for item in GAS_SUPPLIERS], dtype=float)
+        source_utilization = source_mdot / np.maximum(source_capacity, 1e-9)
+        max_pipe_velocity = float(np.max(pipe_velocity)) if pipe_velocity.size else 0.0
+        linepack = self.last_solve_result.equivalent_linepack_indicator if self.last_solve_result else 0.0
+
+        soc_low_margin = np.asarray([
+            self.ess_soc[i] - item.soc_min for i, item in enumerate(ESS_CONFIGS)
+        ], dtype=float)
+        soc_high_margin = np.asarray([
+            item.soc_max - self.ess_soc[i] for i, item in enumerate(ESS_CONFIGS)
+        ], dtype=float)
+        overload = np.maximum(loading - self.config.power.max_line_loading_percent, 0.0)
+        hour = (t * self.config.time.dt_hours) % 24.0
+        day_fraction = (t % self.config.time.steps_per_day) / self.config.time.steps_per_day
+        held_action = np.concatenate([
+            np.asarray(self.last_physical_slow["ess_p_mw"], dtype=float)
+            / np.maximum(np.asarray([item.max_p_mw for item in ESS_CONFIGS], dtype=float), 1e-9),
+            np.asarray(self.last_physical_slow["gfg_p_mw"], dtype=float)
+            / np.maximum(np.asarray([item.max_p_mw for item in GFG_CONFIGS], dtype=float), 1e-9),
+            np.asarray(self.last_physical_slow["p2g_p_mw"], dtype=float)
+            / np.maximum(np.asarray([item.max_p_mw for item in P2G_CONFIGS], dtype=float), 1e-9),
+            np.asarray(self.last_physical_slow["compressor_ratio"], dtype=float)
+            / np.maximum(np.asarray([item.max_pressure_ratio for item in COMPRESSOR_CONFIGS], dtype=float), 1e-9),
+        ])
+        features = {
+            "soc": self.ess_soc.copy(),
+            "soc_low_margin": soc_low_margin,
+            "soc_high_margin": soc_high_margin,
+            "voltage_summary": np.asarray([
+                np.min(vm), np.max(vm),
+                np.sqrt(np.mean(np.square(vm - self.config.power.voltage_target_pu))),
+            ]),
+            "line_summary": np.asarray([
+                np.max(loading) / 100.0,
+                np.sum(overload) / max(100.0 * loading.size, 1.0),
+                np.count_nonzero(overload > 0.0) / max(float(loading.size), 1.0),
+            ]),
+            "power_balance": np.asarray([
+                float(ext_p[0]) / load_scale,
+                float(current["load_multiplier"]),
+                available_total / load_scale,
+                actual_total / load_scale,
+                curtailment_rate,
+            ]),
+            "power_forecast": np.asarray([
+                float(current["load_multiplier"]),
+                float(next_slow["load_multiplier"]),
+                available_total / load_scale,
+                float(np.sum(next_slow["renewable_available_mw"])) / load_scale,
+            ]),
+            "gas_pressure_summary": np.asarray([
+                np.min(gas_pressure), np.max(gas_pressure),
+                np.sqrt(np.mean(np.square(pressure_deviation))),
+            ]),
+            "pipe_summary": np.asarray([
+                max_pipe_velocity / max(self.config.gas.max_pipe_velocity_m_per_s, 1e-9),
+                (self.config.gas.max_pipe_velocity_m_per_s - max_pipe_velocity)
+                / max(self.config.gas.max_pipe_velocity_m_per_s, 1e-9),
+            ]),
+            "source_utilization": source_utilization,
+            "linepack": np.asarray([linepack / 200.0]),
+            "gas_forecast": np.asarray([
+                float(current["gas_multiplier"]), float(next_slow["gas_multiplier"]),
+            ]),
+            "time": np.asarray([
+                np.sin(2.0 * np.pi * hour / 24.0), np.cos(2.0 * np.pi * hour / 24.0),
+                np.sin(2.0 * np.pi * day_fraction), np.cos(2.0 * np.pi * day_fraction),
+            ]),
+            "held_slow_action": held_action,
+        }
+        return {
+            key: np.nan_to_num(np.asarray(value, dtype=np.float32).reshape(-1),
+                               nan=0.0, posinf=10.0, neginf=-10.0)
+            for key, value in features.items()
+        }
 
     # 【中文导读】计算加权成本、物理诊断指标，并返回成本和的负值。
     def _compute_reward(self, solver_failed: bool) -> Tuple[float, Dict[str, float], Dict[str, Any]]:

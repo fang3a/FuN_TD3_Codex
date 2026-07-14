@@ -41,7 +41,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -71,7 +71,11 @@ except Exception:  # pragma: no cover - tensorboard is optional for minimal inst
 from electric_gas_microgrid_single import (
     COMPRESSOR_CONFIGS,
     CONTROLLED_COMPRESSOR_INDICES,
+    ESS_CONFIGS,
     ENV_MODEL_VERSION,
+    GAS_SUPPLIERS,
+    GFG_CONFIGS,
+    P2G_CONFIGS,
     ElectricGasMultiScaleEnv,
 )
 
@@ -88,6 +92,7 @@ GOAL_SLOW_DIM = 8
 GOAL_FAST_DIM = 8
 GOAL_PHYSICAL_DIM = 8
 GOAL_DIM = GOAL_SHARED_DIM + GOAL_SLOW_DIM + GOAL_FAST_DIM + GOAL_PHYSICAL_DIM
+LEGACY_ALGORITHM_API_VERSION = 4
 
 
 # =============================================================================
@@ -107,11 +112,13 @@ class TrainConfig:
 
     # 实验基础设置：随机种子、训练轮数、每轮步数和运行设备。
     seed: int = 42
-    episodes: int = 3
+    episodes: int = 100
     episode_steps: int = EPISODE_STEPS
     manager_interval: int = MANAGER_INTERVAL
     slow_interval: int = SLOW_INTERVAL
-    training_stage: str = "joint_finetune"
+    training_stage: str = "all"
+    run_mode: str = "formal"
+    exploration_episode_offset: int = 0
     device: str = "auto"
 
     # 神经网络大小。latent_dim 是 Encoder 压缩后的隐藏状态维度。
@@ -182,6 +189,13 @@ class TrainConfig:
     checkpoint_dir: str = "hierarchical_td3_runs"
     load_checkpoint: str = ""
     load_policy_only: bool = False
+    checkpoint_load_mode: str = "resume"
+    eval_seed_mode: str = "fixed"
+    best_model_metric: str = "feasible_then_return"
+    save_replay_in_checkpoint: bool = True
+    bootstrap_on_time_limit: bool = False
+    full_resume_checkpoint_interval: int = 5
+    strict_resume_required: bool = True
     no_tensorboard: bool = False
     run_tests: bool = False
 
@@ -208,6 +222,30 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state: Mapping[str, Any]) -> None:
+    required = ("python", "numpy", "torch")
+    missing = [name for name in required if name not in state]
+    if missing:
+        raise ValueError(f"rng_state is missing required entries: {missing}")
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(torch.as_tensor(state["torch"], dtype=torch.uint8).cpu())
+    if torch.cuda.is_available() and "torch_cuda" in state:
+        cuda_states = [torch.as_tensor(item, dtype=torch.uint8).cpu() for item in state["torch_cuda"]]
+        torch.cuda.set_rng_state_all(cuda_states)
 
 
 # 【中文导读】把 auto/cpu/cuda 配置解析为 PyTorch 设备。
@@ -289,6 +327,40 @@ def normalize_goal_np(goal: np.ndarray) -> np.ndarray:
     # 后 8 维表示物理参考量，用 tanh 限制到 [-1, 1]，避免 goal 无界。
     g[24:32] = np.tanh(g[24:32])
     return g.astype(np.float32)
+
+
+def execute_manager_goal_np(raw_goal: np.ndarray, previous_executed_goal: np.ndarray,
+                            smoothing: float) -> np.ndarray:
+    """Apply the exact interaction-time Manager goal transform."""
+
+    def canonical(value: np.ndarray) -> np.ndarray:
+        result = np.asarray(value, dtype=np.float32).copy()
+        for start in (0, 8, 16):
+            norm = max(float(np.linalg.norm(result[start:start + 8])), 1e-8)
+            result[start:start + 8] /= norm
+        result[24:32] = np.clip(result[24:32], -1.0, 1.0)
+        return result
+
+    raw = canonical(raw_goal)
+    previous = canonical(previous_executed_goal)
+    return canonical((1.0 - float(smoothing)) * raw + float(smoothing) * previous)
+
+
+def execute_manager_goal_tensor(raw_goal: torch.Tensor, previous_executed_goal: torch.Tensor,
+                                smoothing: float) -> torch.Tensor:
+    """Differentiable counterpart used by Manager Actor and target Actor updates."""
+
+    def canonical(value: torch.Tensor) -> torch.Tensor:
+        return torch.cat([
+            F.normalize(value[..., 0:8], p=2, dim=-1, eps=1e-8),
+            F.normalize(value[..., 8:16], p=2, dim=-1, eps=1e-8),
+            F.normalize(value[..., 16:24], p=2, dim=-1, eps=1e-8),
+            value[..., 24:32].clamp(-1.0, 1.0),
+        ], dim=-1)
+
+    raw = canonical(raw_goal)
+    previous = canonical(previous_executed_goal)
+    return canonical((1.0 - float(smoothing)) * raw + float(smoothing) * previous)
 
 
 # 【中文导读】Slow/Fast Worker 从 32 维完整 goal 中提取 shared、private、physical 共 24 维条件。
@@ -415,7 +487,14 @@ class EpisodeCSVLogger:
             "voltage_violation_cost", "gas_pressure_violation_cost",
             "pipe_velocity_violation_cost", "source_capacity_violation_cost",
             "gas_purchase_cost",
-            "worker_reward_clips", "manager_reward_clips",
+            "interaction_reward_estimated_clips", "manager_reward_clips",
+            "fast_total_insertions", "slow_total_insertions", "manager_total_insertions",
+            "fast_update_count", "slow_update_count", "manager_update_count",
+            "fast_actor_update_count", "slow_actor_update_count", "manager_actor_update_count",
+            "fast_critic_update_count", "slow_critic_update_count", "manager_critic_update_count",
+            "nonfinite_batch_count", "fast_normalizer_count", "slow_normalizer_count",
+            "manager_normalizer_count", "mean_target_q_clipping_ratio",
+            "mean_reward_clipping_ratio", "mean_actor_action_saturation_ratio",
         ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", newline="", encoding="utf-8") as f:
@@ -433,6 +512,61 @@ class EpisodeCSVLogger:
 # =============================================================================
 
 
+@dataclass(frozen=True)
+class SlowObservationLayout:
+    """Single source of truth for the compact Slow Worker safety observation."""
+
+    fields: Tuple[Tuple[str, int], ...] = (
+        ("soc", len(ESS_CONFIGS)),
+        ("soc_low_margin", len(ESS_CONFIGS)),
+        ("soc_high_margin", len(ESS_CONFIGS)),
+        ("voltage_summary", 3),
+        ("line_summary", 3),
+        ("power_balance", 5),
+        ("power_forecast", 4),
+        ("gas_pressure_summary", 3),
+        ("pipe_summary", 2),
+        ("source_utilization", len(GAS_SUPPLIERS)),
+        ("linepack", 1),
+        ("gas_forecast", 2),
+        ("time", 4),
+        ("held_slow_action", len(ESS_CONFIGS) + len(GFG_CONFIGS)
+         + len(P2G_CONFIGS) + len(COMPRESSOR_CONFIGS)),
+    )
+
+    @property
+    def dimension(self) -> int:
+        return int(sum(size for _, size in self.fields))
+
+    @property
+    def slices(self) -> Dict[str, slice]:
+        result: Dict[str, slice] = {}
+        cursor = 0
+        for name, size in self.fields:
+            result[name] = slice(cursor, cursor + size)
+            cursor += size
+        return result
+
+    def flatten(self, values: Mapping[str, np.ndarray]) -> np.ndarray:
+        pieces: List[np.ndarray] = []
+        for name, size in self.fields:
+            if name not in values:
+                raise KeyError(f"Slow safety state is missing field {name!r}")
+            piece = np.asarray(values[name], dtype=np.float32).reshape(-1)
+            if piece.size != size:
+                raise ValueError(
+                    f"Slow safety field {name!r} has size={piece.size}, expected={size}"
+                )
+            pieces.append(piece)
+        result = np.concatenate(pieces).astype(np.float32)
+        if result.size != self.dimension:
+            raise AssertionError(f"Slow observation size={result.size}, expected={self.dimension}")
+        return np.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
+
+
+SLOW_OBSERVATION_LAYOUT = SlowObservationLayout()
+
+
 # 【中文导读】从环境全局状态构造 Manager、快 Worker、慢 Worker 的任务相关观测。
 class ObservationBuilder:
     """从环境读取多层状态，并补充训练所需的少量上下文。"""
@@ -442,10 +576,18 @@ class ObservationBuilder:
         self.manager_interval = manager_interval
 
     # 【中文导读】返回 Manager 使用的全局电—气状态。
-    def manager_obs(self, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
+    def manager_obs(self, fallback_global: Optional[np.ndarray] = None,
+                    previous_executed_goal: Optional[np.ndarray] = None) -> np.ndarray:
         if hasattr(self.env, "get_manager_state"):
-            return np.asarray(self.env.get_manager_state(), dtype=np.float32)
-        return np.asarray(fallback_global, dtype=np.float32)
+            base = np.asarray(self.env.get_manager_state(), dtype=np.float32)
+        else:
+            base = np.asarray(fallback_global, dtype=np.float32)
+        previous = np.zeros(GOAL_DIM, dtype=np.float32) if previous_executed_goal is None else np.asarray(
+            previous_executed_goal, dtype=np.float32
+        ).reshape(-1)
+        if previous.size != GOAL_DIM:
+            raise ValueError(f"previous_executed_goal size={previous.size}, expected={GOAL_DIM}")
+        return np.nan_to_num(np.concatenate([base.reshape(-1), previous]), nan=0.0).astype(np.float32)
 
     # 【中文导读】构造以电侧为主、补充时间、SOC、慢设备设定和 goal 年龄的快观测。
     def fast_obs(self, manager_age_steps: int, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
@@ -469,14 +611,10 @@ class ObservationBuilder:
 
     # 【中文导读】构造以储能和气网为主、补充预测时间特征的慢观测。
     def slow_obs(self, fallback_global: Optional[np.ndarray] = None) -> np.ndarray:
-        global_obs = np.asarray(fallback_global if fallback_global is not None else self.env.get_global_state(),
-                                dtype=np.float32)
-        if hasattr(self.env, "get_slow_worker_state"):
-            base = np.asarray(self.env.get_slow_worker_state(), dtype=np.float32)
-        else:
-            base = global_obs
-        # get_slow_worker_state() already includes the environment time features.
-        return np.nan_to_num(base.astype(np.float32), nan=0.0)
+        del fallback_global
+        if not hasattr(self.env, "get_slow_safety_features"):
+            raise RuntimeError("Environment must expose get_slow_safety_features()")
+        return SLOW_OBSERVATION_LAYOUT.flatten(self.env.get_slow_safety_features())
 
 
 # =============================================================================
@@ -508,8 +646,10 @@ class FastReplayBuffer:
         self.next_goals = np.zeros((capacity, goal_dim), dtype=np.float32)
         self.goal_changed = np.zeros((capacity, 1), dtype=np.float32)
         self.dones = np.zeros((capacity, 1), dtype=np.float32)
+        self.duration_steps = np.ones((capacity, 1), dtype=np.float32)
         self.idx = 0
         self.full = False
+        self.total_insertions = 0
 
     def add(self, obs: np.ndarray, next_obs: np.ndarray, raw_action: np.ndarray, executed_action: np.ndarray,
             reward_external: float, reward_intrinsic: float, reward_total: float, goal: np.ndarray,
@@ -526,8 +666,10 @@ class FastReplayBuffer:
         self.next_goals[i] = next_goal
         self.goal_changed[i, 0] = float(np.linalg.norm(goal - next_goal) > 1e-6)
         self.dones[i, 0] = float(done)
+        self.duration_steps[i, 0] = 1.0
         self.idx += 1
         self.full = self.full or self.idx >= self.capacity
+        self.total_insertions += 1
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         max_idx = len(self)
@@ -545,10 +687,25 @@ class FastReplayBuffer:
             "next_goals": to_tensor(self.next_goals[idx], self.device),
             "goal_changed": to_tensor(self.goal_changed[idx], self.device),
             "dones": to_tensor(self.dones[idx], self.device),
+            "duration_steps": to_tensor(self.duration_steps[idx], self.device),
         }
 
     def __len__(self) -> int:
         return self.capacity if self.full else self.idx
+
+    def state_dict(self) -> Dict[str, Any]:
+        return _replay_state_dict(self, (
+            "obs", "next_obs", "raw_actions", "executed_actions", "reward_external",
+            "reward_intrinsic", "reward_total", "goals", "next_goals", "goal_changed", "dones",
+            "duration_steps",
+        ))
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        _load_replay_state_dict(self, state, (
+            "obs", "next_obs", "raw_actions", "executed_actions", "reward_external",
+            "reward_intrinsic", "reward_total", "goals", "next_goals", "goal_changed", "dones",
+            "duration_steps",
+        ))
 
 
 # 【中文导读】保存跨多个快速步的慢时间尺度 SMDP 片段及 duration_steps。
@@ -573,6 +730,7 @@ class SlowReplayBuffer:
         self.duration_steps = np.zeros((capacity, 1), dtype=np.float32)
         self.idx = 0
         self.full = False
+        self.total_insertions = 0
 
     def add(self, obs_start: np.ndarray, obs_end: np.ndarray, raw_action: np.ndarray, executed_action: np.ndarray,
             discounted_reward: float, goal: np.ndarray, next_goal: np.ndarray, done: bool,
@@ -589,6 +747,7 @@ class SlowReplayBuffer:
         self.duration_steps[i, 0] = float(duration_steps)
         self.idx += 1
         self.full = self.full or self.idx >= self.capacity
+        self.total_insertions += 1
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         max_idx = len(self)
@@ -608,6 +767,18 @@ class SlowReplayBuffer:
     def __len__(self) -> int:
         return self.capacity if self.full else self.idx
 
+    def state_dict(self) -> Dict[str, Any]:
+        return _replay_state_dict(self, (
+            "obs_start", "obs_end", "raw_actions", "executed_actions", "discounted_reward",
+            "goals", "next_goals", "dones", "duration_steps",
+        ))
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        _load_replay_state_dict(self, state, (
+            "obs_start", "obs_end", "raw_actions", "executed_actions", "discounted_reward",
+            "goals", "next_goals", "dones", "duration_steps",
+        ))
+
 
 # 【中文导读】保存一个 Manager goal 持续区间的全局起止状态和折扣外在回报。
 class ManagerReplayBuffer:
@@ -622,24 +793,42 @@ class ManagerReplayBuffer:
         self.device = device
         self.global_obs_start = np.zeros((capacity, obs_dim), dtype=np.float32)
         self.global_obs_end = np.zeros((capacity, obs_dim), dtype=np.float32)
+        # manager_goals remains the executed-goal array for old checkpoints.
         self.manager_goals = np.zeros((capacity, goal_dim), dtype=np.float32)
+        self.raw_goals = np.zeros((capacity, goal_dim), dtype=np.float32)
+        self.previous_executed_goals = np.zeros((capacity, goal_dim), dtype=np.float32)
         self.discounted_external_reward = np.zeros((capacity, 1), dtype=np.float32)
         self.dones = np.zeros((capacity, 1), dtype=np.float32)
         self.duration_steps = np.zeros((capacity, 1), dtype=np.float32)
+        self.segment_constraint_mean = np.zeros((capacity, 1), dtype=np.float32)
+        self.segment_constraint_max = np.zeros((capacity, 1), dtype=np.float32)
+        self.solver_failure_seen = np.zeros((capacity, 1), dtype=np.float32)
         self.idx = 0
         self.full = False
+        self.total_insertions = 0
 
     def add(self, global_obs_start: np.ndarray, global_obs_end: np.ndarray, manager_goal: np.ndarray,
-            discounted_external_reward: float, done: bool, duration_steps: int) -> None:
+            discounted_external_reward: float, done: bool, duration_steps: int,
+            segment_constraint_mean: float = 0.0, segment_constraint_max: float = 0.0,
+            solver_failure_seen: bool = False, raw_goal: Optional[np.ndarray] = None,
+            previous_executed_goal: Optional[np.ndarray] = None) -> None:
         i = self.idx % self.capacity
         self.global_obs_start[i] = global_obs_start
         self.global_obs_end[i] = global_obs_end
         self.manager_goals[i] = manager_goal
+        self.raw_goals[i] = manager_goal if raw_goal is None else raw_goal
+        self.previous_executed_goals[i] = (
+            np.zeros_like(manager_goal) if previous_executed_goal is None else previous_executed_goal
+        )
         self.discounted_external_reward[i, 0] = discounted_external_reward
         self.dones[i, 0] = float(done)
         self.duration_steps[i, 0] = float(duration_steps)
+        self.segment_constraint_mean[i, 0] = float(segment_constraint_mean)
+        self.segment_constraint_max[i, 0] = float(segment_constraint_max)
+        self.solver_failure_seen[i, 0] = float(bool(solver_failure_seen))
         self.idx += 1
         self.full = self.full or self.idx >= self.capacity
+        self.total_insertions += 1
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
         max_idx = len(self)
@@ -648,6 +837,9 @@ class ManagerReplayBuffer:
             "obs": to_tensor(self.global_obs_start[idx], self.device),
             "next_obs": to_tensor(self.global_obs_end[idx], self.device),
             "goals": to_tensor(self.manager_goals[idx], self.device),
+            "executed_goals": to_tensor(self.manager_goals[idx], self.device),
+            "raw_goals": to_tensor(self.raw_goals[idx], self.device),
+            "previous_executed_goals": to_tensor(self.previous_executed_goals[idx], self.device),
             "rewards": to_tensor(self.discounted_external_reward[idx], self.device),
             "dones": to_tensor(self.dones[idx], self.device),
             "duration_steps": to_tensor(self.duration_steps[idx], self.device),
@@ -655,6 +847,125 @@ class ManagerReplayBuffer:
 
     def __len__(self) -> int:
         return self.capacity if self.full else self.idx
+
+    def state_dict(self) -> Dict[str, Any]:
+        return _replay_state_dict(self, (
+            "global_obs_start", "global_obs_end", "manager_goals", "raw_goals",
+            "previous_executed_goals",
+            "discounted_external_reward", "dones", "duration_steps",
+            "segment_constraint_mean", "segment_constraint_max", "solver_failure_seen",
+        ))
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        _load_replay_state_dict(self, state, (
+            "global_obs_start", "global_obs_end", "manager_goals", "raw_goals",
+            "previous_executed_goals",
+            "discounted_external_reward", "dones", "duration_steps",
+            "segment_constraint_mean", "segment_constraint_max", "solver_failure_seen",
+        ))
+
+
+def _replay_state_dict(buffer: Any, array_names: Sequence[str]) -> Dict[str, Any]:
+    valid_size = int(len(buffer))
+    stored_size = int(buffer.capacity if buffer.full else valid_size)
+    if hasattr(buffer, "obs"):
+        obs_dim = int(buffer.obs.shape[1])
+    elif hasattr(buffer, "obs_start"):
+        obs_dim = int(buffer.obs_start.shape[1])
+    else:
+        obs_dim = int(buffer.global_obs_start.shape[1])
+    action_dim = 0
+    if hasattr(buffer, "raw_actions"):
+        action_dim = int(buffer.raw_actions.shape[1])
+    goal_array = getattr(buffer, "goals", getattr(buffer, "manager_goals", None))
+    goal_dim = int(goal_array.shape[1]) if goal_array is not None else 0
+    state: Dict[str, Any] = {
+        "replay_schema_version": 3,
+        "replay_type": type(buffer).__name__,
+        "capacity": int(buffer.capacity),
+        "valid_size": valid_size,
+        "idx": int(buffer.idx),
+        "full": bool(buffer.full),
+        "total_insertions": int(buffer.total_insertions),
+        "obs_dim": obs_dim,
+        "action_dim": action_dim,
+        "goal_dim": goal_dim,
+        "dtype": "float32",
+    }
+    for name in array_names:
+        if hasattr(buffer, name):
+            state[name] = np.asarray(getattr(buffer, name))[:stored_size].copy()
+    return state
+
+
+def _load_replay_state_dict(buffer: Any, state: Mapping[str, Any], array_names: Sequence[str]) -> None:
+    saved_capacity = int(state.get("capacity", -1))
+    if saved_capacity != int(buffer.capacity):
+        raise ValueError(
+            f"Replay capacity mismatch: checkpoint={saved_capacity}, current={buffer.capacity}"
+        )
+    schema = int(state.get("replay_schema_version", 1))
+    if schema not in (1, 2):
+        raise ValueError(f"Unsupported replay_schema_version={schema}")
+    if schema == 2:
+        expected_type = type(buffer).__name__
+        if state.get("replay_type") != expected_type:
+            raise ValueError(
+                f"Replay type mismatch: checkpoint={state.get('replay_type')!r}, current={expected_type!r}"
+            )
+        expected_obs = (buffer.obs.shape[1] if hasattr(buffer, "obs") else
+                        buffer.obs_start.shape[1] if hasattr(buffer, "obs_start") else
+                        buffer.global_obs_start.shape[1])
+        expected_action = buffer.raw_actions.shape[1] if hasattr(buffer, "raw_actions") else 0
+        goal_array = getattr(buffer, "goals", getattr(buffer, "manager_goals", None))
+        expected_goal = goal_array.shape[1] if goal_array is not None else 0
+        for name, expected in (("obs_dim", expected_obs), ("action_dim", expected_action),
+                               ("goal_dim", expected_goal)):
+            if int(state.get(name, -1)) != int(expected):
+                raise ValueError(
+                    f"Replay {name} mismatch: checkpoint={state.get(name)!r}, current={expected}"
+                )
+        if state.get("dtype") != "float32":
+            raise ValueError(f"Replay dtype mismatch: checkpoint={state.get('dtype')!r}, expected='float32'")
+    full = bool(state.get("full", False))
+    idx = int(state.get("idx", 0))
+    valid_size = int(state.get("valid_size", saved_capacity if full else idx))
+    if not 0 <= valid_size <= saved_capacity:
+        raise ValueError(f"Replay valid_size={valid_size} must be in [0,{saved_capacity}]")
+    if full and (valid_size != saved_capacity or idx < saved_capacity):
+        raise ValueError(f"Invalid full Replay state: valid_size={valid_size}, idx={idx}, capacity={saved_capacity}")
+    if not full and (idx != valid_size or idx >= saved_capacity):
+        raise ValueError(f"Invalid partial Replay state: valid_size={valid_size}, idx={idx}, capacity={saved_capacity}")
+    stored_size = saved_capacity if full else valid_size
+    for name in array_names:
+        if not hasattr(buffer, name):
+            continue
+        if name not in state:
+            raise ValueError(f"Replay state is missing required array {name!r}")
+        target = getattr(buffer, name)
+        raw_value = np.asarray(state[name])
+        if schema == 2 and str(raw_value.dtype) != str(target.dtype):
+            raise ValueError(
+                f"Replay array {name} dtype mismatch: checkpoint={raw_value.dtype}, current={target.dtype}"
+            )
+        value = raw_value.astype(target.dtype, copy=False)
+        # Schema 1 checkpoints predate compact serialization and always contain
+        # the complete capacity, even when the Replay had not filled yet.
+        array_stored_size = saved_capacity if schema == 1 else stored_size
+        expected_shape = (array_stored_size,) + target.shape[1:]
+        if value.shape != expected_shape:
+            raise ValueError(
+                f"Replay array {name} shape mismatch: checkpoint={value.shape}, expected={expected_shape}"
+            )
+        target[...] = 0
+        target[:array_stored_size] = value
+    buffer.idx = idx
+    buffer.full = full
+    buffer.total_insertions = int(state.get("total_insertions", buffer.idx))
+    if buffer.idx < 0 or buffer.total_insertions < 0:
+        raise ValueError(
+            f"Invalid Replay counters: idx={buffer.idx}, total_insertions={buffer.total_insertions}"
+        )
 
 
 # =============================================================================
@@ -802,24 +1113,25 @@ class ManagerTD3:
         self.normalizer = RunningMeanStd((obs_dim,))
         self.total_updates = 0
 
-    # 【中文导读】归一化全局观测，生成 goal，叠加探索噪声，并与上一 goal 平滑。
-    def select_goal(self, obs: np.ndarray, previous_goal: Optional[np.ndarray], noise_std: float,
-                    deterministic: bool = False) -> np.ndarray:
-        """根据 Manager 观测选择 goal；训练时加探索噪声，评估时 deterministic。"""
-
+    def select_goal_pair(self, obs: np.ndarray, previous_goal: Optional[np.ndarray], noise_std: float,
+                         deterministic: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """Return raw and executed goals with the same transform used by training."""
         self.normalizer.update(obs)
         obs_n = self.normalizer.normalize(obs)
         with torch.no_grad():
             z = self.encoder(to_tensor(obs_n[None, :], self.device))
-            goal = self.actor(z).cpu().numpy()[0]
+            raw_goal = self.actor(z).cpu().numpy()[0]
         if not deterministic and noise_std > 0.0:
-            goal += np.random.normal(0.0, noise_std, size=goal.shape).astype(np.float32)
-            goal = normalize_goal_np(goal)
-        if previous_goal is not None and self.cfg.goal_smoothing > 0.0:
-            # goal 平滑能避免高层目标剧烈跳变，降低下层 Worker 学习难度。
-            smoothed = (1.0 - self.cfg.goal_smoothing) * goal + self.cfg.goal_smoothing * previous_goal
-            goal = normalize_goal_np(smoothed)
-        return goal.astype(np.float32)
+            raw_goal += np.random.normal(0.0, noise_std, size=raw_goal.shape).astype(np.float32)
+        raw_goal = normalize_goal_np(raw_goal)
+        previous = np.zeros(GOAL_DIM, dtype=np.float32) if previous_goal is None else previous_goal
+        executed_goal = execute_manager_goal_np(raw_goal, previous, self.cfg.goal_smoothing)
+        return raw_goal.astype(np.float32), executed_goal.astype(np.float32)
+
+    # Compatibility interface: Workers always receive the executed goal.
+    def select_goal(self, obs: np.ndarray, previous_goal: Optional[np.ndarray], noise_std: float,
+                    deterministic: bool = False) -> np.ndarray:
+        return self.select_goal_pair(obs, previous_goal, noise_std, deterministic)[1]
 
     # 【中文导读】用 Manager 聚合样本执行双 Critic 回归、延迟 Actor 更新和目标网络软更新。
     def update(self, buffer: ManagerReplayBuffer, batch_size: int) -> Dict[str, float]:
@@ -828,7 +1140,8 @@ class ManagerTD3:
         data = buffer.sample(batch_size)
         obs = to_tensor(self.normalizer.normalize(data["obs"].cpu().numpy()), self.device)
         next_obs = to_tensor(self.normalizer.normalize(data["next_obs"].cpu().numpy()), self.device)
-        goals = data["goals"]
+        goals = data.get("executed_goals", data["goals"])
+        previous_goals = data.get("previous_executed_goals", torch.zeros_like(goals))
         rewards = data["rewards"]
         dones = data["dones"]
 
@@ -837,13 +1150,18 @@ class ManagerTD3:
             # TD3 目标：target actor 给 next_goal，target critic 给 next Q。
             # 加截断噪声是 TD3 的 target policy smoothing，可降低 Q 对尖锐动作的过拟合。
             next_z = self.target_encoder(next_obs)
-            next_goal = self.target_actor(next_z)
-            noise = torch.randn_like(next_goal) * self.cfg.target_noise
-            next_goal = normalize_goal_tensor(next_goal + noise.clamp(-self.cfg.target_noise_clip,
-                                                                      self.cfg.target_noise_clip))
+            next_raw_goal = self.target_actor(next_z)
+            noise = torch.randn_like(next_raw_goal) * self.cfg.target_noise
+            next_raw_goal = normalize_goal_tensor(
+                next_raw_goal + noise.clamp(-self.cfg.target_noise_clip, self.cfg.target_noise_clip)
+            )
+            next_goal = execute_manager_goal_tensor(next_raw_goal, goals, self.cfg.goal_smoothing)
             q1_next, q2_next = self.target_critic(next_z, next_goal)
             q_next = torch.minimum(q1_next, q2_next)
-            target_q = rewards + (1.0 - dones) * self.cfg.gamma_manager * q_next
+            target_q = rewards + (1.0 - dones) * torch.pow(
+                torch.as_tensor(self.cfg.gamma_fast, dtype=data["duration_steps"].dtype,
+                                device=self.device), data["duration_steps"]
+            ) * q_next
             if self.cfg.target_q_clip_abs > 0.0:
                 target_q = target_q.clamp(-self.cfg.target_q_clip_abs, self.cfg.target_q_clip_abs)
 
@@ -859,15 +1177,23 @@ class ManagerTD3:
         clip_grad(self.encoder.parameters(), self.cfg.gradient_clip)
         self.critic_optim.step()
         self.encoder_optim.step()
+        self.critic_optim.zero_grad(set_to_none=True)
 
         actor_loss_value = 0.0
         if self.total_updates % self.cfg.policy_frequency == 0:
             # Delayed policy update：Critic 多学几步后再更新 Actor，是 TD3 的稳定技巧。
             z_pi = self.encoder(obs).detach()
-            goals_pi = self.actor(z_pi)
-            actor_loss = -self.critic.q_min(z_pi, goals_pi).mean()
             self.actor_optim.zero_grad()
-            actor_loss.backward()
+            set_requires_grad(self.critic, False)
+            try:
+                raw_goals_pi = self.actor(z_pi)
+                goals_pi = execute_manager_goal_tensor(
+                    raw_goals_pi, previous_goals, self.cfg.goal_smoothing
+                )
+                actor_loss = -self.critic.q_min(z_pi, goals_pi).mean()
+                actor_loss.backward()
+            finally:
+                set_requires_grad(self.critic, True)
             clip_grad(self.actor.parameters(), self.cfg.gradient_clip)
             self.actor_optim.step()
             actor_loss_value = float(actor_loss.detach().cpu())
@@ -1025,7 +1351,9 @@ class WorkerTD3:
         if self.transition_model is not None:
             # 让Encoder的隐空间也服务于可预测的状态变化，但不在这一步更新TransitionModel参数。
             with torch.no_grad():
-                target_delta_for_encoder = self.target_encoder(next_obs) - z.detach()
+                target_z_for_encoder = self.target_encoder(obs)
+                target_next_z_for_encoder = self.target_encoder(next_obs)
+                target_delta_for_encoder = target_next_z_for_encoder - target_z_for_encoder
             set_requires_grad(self.transition_model, False)
             try:
                 pred_delta_for_encoder = self.transition_model(z, actions)
@@ -1044,13 +1372,15 @@ class WorkerTD3:
         clip_grad(self.encoder.parameters(), self.cfg.gradient_clip)
         self.critic_optim.step()
         self.encoder_optim.step()
+        self.critic_optim.zero_grad(set_to_none=True)
 
         transition_loss_value = 0.0
         if self.transition_model is not None and self.transition_optim is not None:
             with torch.no_grad():
                 z_detached = self.encoder(obs).detach()
+                z_target = self.target_encoder(obs)
                 next_z_target = self.target_encoder(next_obs)
-                target_delta = next_z_target - z_detached
+                target_delta = next_z_target - z_target
             pred_delta = self.transition_model(z_detached, actions)
             transition_loss = F.mse_loss(pred_delta, target_delta.detach())
             self.transition_optim.zero_grad()
@@ -1065,21 +1395,27 @@ class WorkerTD3:
             # Actor 的目标是最大化 Critic 认为好的动作；代码里写成最小化 -Q。
             z_pi = self.encoder(obs).detach()
             # Actor 输出仍是未经过环境安全投影的 raw action；因此需关注策略—执行动作偏差。
-            actions_pi = self.actor(z_pi, wg)
-            actor_loss = -self.critic.q_min(z_pi, wg, actions_pi).mean()
-            if self.cfg.worker_action_l2_weight > 0.0:
-                actor_loss = actor_loss + self.cfg.worker_action_l2_weight * actions_pi.pow(2).mean()
-            if self.cfg.projection_imitation_weight > 0.0:
-                projection_imitation_loss = F.mse_loss(actions_pi, actions)
-                actor_loss = actor_loss + self.cfg.projection_imitation_weight * projection_imitation_loss
-                projection_imitation_loss_value = float(projection_imitation_loss.detach().cpu())
-            if self.transition_model is not None and self.cfg.reachability_weight > 0.0:
-                predicted_delta = self.transition_model(z_pi, actions_pi)
-                direction = expanded_goal_direction_tensor(goals, self.role, self.latent_dim)
-                reachability = 1.0 - F.cosine_similarity(predicted_delta, direction, dim=-1, eps=1e-8).mean()
-                actor_loss = actor_loss + self.cfg.reachability_weight * reachability
             self.actor_optim.zero_grad()
-            actor_loss.backward()
+            set_requires_grad(self.critic, False)
+            try:
+                actions_pi = self.actor(z_pi, wg)
+                actor_loss = -self.critic.q_min(z_pi, wg, actions_pi).mean()
+                if self.cfg.worker_action_l2_weight > 0.0:
+                    actor_loss = actor_loss + self.cfg.worker_action_l2_weight * actions_pi.pow(2).mean()
+                if self.cfg.projection_imitation_weight > 0.0:
+                    projection_imitation_loss = F.mse_loss(actions_pi, actions)
+                    actor_loss = actor_loss + self.cfg.projection_imitation_weight * projection_imitation_loss
+                    projection_imitation_loss_value = float(projection_imitation_loss.detach().cpu())
+                if self.transition_model is not None and self.cfg.reachability_weight > 0.0:
+                    predicted_delta = self.transition_model(z_pi, actions_pi)
+                    direction = expanded_goal_direction_tensor(goals, self.role, self.latent_dim)
+                    reachability = 1.0 - F.cosine_similarity(
+                        predicted_delta, direction, dim=-1, eps=1e-8
+                    ).mean()
+                    actor_loss = actor_loss + self.cfg.reachability_weight * reachability
+                actor_loss.backward()
+            finally:
+                set_requires_grad(self.critic, True)
             clip_grad(self.actor.parameters(), self.cfg.gradient_clip)
             self.actor_optim.step()
             actor_loss_value = float(actor_loss.detach().cpu())
@@ -1172,15 +1508,20 @@ def build_agents(env: ElectricGasMultiScaleEnv, cfg: TrainConfig, device: torch.
 # =============================================================================
 
 
+GLOBAL_SAFETY_COMPONENTS = (
+    "voltage_deviation", "voltage_violation", "line_overload",
+    "soc_soft", "terminal_soc", "gas_pressure_deviation", "gas_pressure_violation",
+    "pipe_velocity_violation", "source_capacity_violation", "solver_failure",
+)
 FAST_COMPONENTS = (
     "voltage_deviation", "voltage_violation", "line_overload",
-    "power_loss", "renewable_curtailment", "solver_failure",
+    "power_loss", "renewable_curtailment",
 )
 SLOW_COMPONENTS = (
     "gas_pressure_deviation", "gas_pressure_violation",
     "pipe_velocity_violation", "source_capacity_violation",
     "soc_soft", "terminal_soc", "compressor_energy", "ess_action_change",
-    "gfg_action_change", "p2g_action_change", "solver_failure",
+    "gfg_action_change", "p2g_action_change",
 )
 
 
@@ -1190,6 +1531,56 @@ def external_reward_from_components(info: Dict[str, Any], keys: Tuple[str, ...])
 
     comps = info.get("reward_components", {})
     return -float(sum(float(comps.get(k, 0.0)) for k in keys))
+
+
+def worker_safety_reward_from_components(info: Dict[str, Any], role: str,
+                                         cfg: TrainConfig) -> Dict[str, float]:
+    """Build global and role-specific safety rewards without economic terms."""
+
+    components = info.get("reward_components", {})
+    role_keys = FAST_COMPONENTS if role == "fast" else SLOW_COMPONENTS
+    component_clip = float(getattr(cfg, "worker_component_clip_abs", 0.0))
+
+    def group(keys: Tuple[str, ...]) -> Tuple[float, float]:
+        raw_costs = np.asarray([float(components.get(name, 0.0)) for name in keys], dtype=float)
+        clipped_costs = raw_costs
+        if component_clip > 0.0:
+            clipped_costs = np.clip(raw_costs, -component_clip, component_clip)
+        return -float(np.sum(raw_costs)), -float(np.sum(clipped_costs))
+
+    global_raw, global_used = group(GLOBAL_SAFETY_COMPONENTS)
+    role_raw, role_used = group(role_keys)
+    global_weight = float(getattr(cfg, f"{role}_global_safety_weight", 0.0))
+    role_weight = float(getattr(cfg, f"{role}_role_specific_weight", 1.0))
+    global_weighted = global_weight * global_used
+    role_weighted = role_weight * role_used
+    total = global_weighted + role_weighted
+    raw_total = global_weight * global_raw + role_weight * role_raw
+    return {
+        "global_raw": global_raw,
+        "global_used": global_used,
+        "global_weighted": global_weighted,
+        "role_raw": role_raw,
+        "role_used": role_used,
+        "role_weighted": role_weighted,
+        "total": total,
+        "raw_total": raw_total,
+        "component_clipped": float(abs(total - raw_total) > 1e-9),
+    }
+
+
+def apply_debug_terminal_soc_penalty(env: ElectricGasMultiScaleEnv, info: Dict[str, Any],
+                                     reward: float, cfg: TrainConfig) -> float:
+    """Add the environment's terminal-SOC safety cost to an early debug truncation."""
+
+    if not bool(getattr(cfg, "debug_terminal_soc_penalty", True)):
+        return float(reward)
+    initial = np.asarray([item.soc_initial for item in ESS_CONFIGS], dtype=float)
+    terminal_cost = float(env.config.reward.terminal_soc * np.sum(np.square(env.ess_soc - initial)))
+    components = info.setdefault("reward_components", {})
+    components["terminal_soc"] = float(components.get("terminal_soc", 0.0)) + terminal_cost
+    info["debug_terminal_soc_cost"] = terminal_cost
+    return float(reward) - terminal_cost
 
 
 # 【中文导读】根据 raw 与 executed 动作的均方距离惩罚不可行动作请求。
@@ -1251,6 +1642,16 @@ def scheduled_noise(initial: float, minimum: float, episode: int, decay_episodes
         return float(initial)
     fraction = min(max(float(episode) / float(decay_episodes), 0.0), 1.0)
     return float(initial + fraction * (minimum - initial))
+
+
+def warmup_actor_blend(count: int, warmup_count: int, blend_fraction: float) -> float:
+    """Ramp Actor participation over the final part of safety warm-up."""
+
+    if warmup_count <= 0 or count >= warmup_count:
+        return 1.0
+    blend_steps = max(int(math.ceil(warmup_count * float(blend_fraction))), 1)
+    blend_start = max(warmup_count - blend_steps, 0)
+    return float(np.clip((count - blend_start) / blend_steps, 0.0, 1.0))
 
 
 # =============================================================================
@@ -1350,6 +1751,8 @@ def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: n
     try:
         return env.step(action)
     except Exception as exc:
+        if getattr(env, "unexpected_env_exception_policy", "raise") == "raise":
+            raise
         LOGGER.warning("Environment step failed and was converted to a failed transition: %r", exc)
         info = {
             "solver_failed": True,
@@ -1387,21 +1790,222 @@ def checkpoint_metadata(agents: AgentBundle) -> Dict[str, Any]:
     }
 
 
+def is_feasible(metrics: Mapping[str, Any], cfg: TrainConfig) -> Tuple[bool, List[str]]:
+    """Evaluate every configured solver and hard-safety threshold in one place."""
+
+    checks = (
+        ("solver_failures", "<=", 0.0),
+        ("power_solver_success_rate", ">=", float(getattr(cfg, "min_power_success_rate", 0.999))),
+        ("gas_solver_success_rate", ">=", float(getattr(cfg, "min_gas_success_rate", 0.999))),
+        ("soc_violation_rate", "<=", float(getattr(cfg, "max_soc_violation_rate", 0.0))),
+        ("voltage_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
+        ("gas_pressure_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
+        ("line_overload_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
+        ("pipe_velocity_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
+        ("source_capacity_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
+        ("mean_voltage_rms_deviation_pu", "<=", float(getattr(cfg, "max_voltage_rms_deviation_pu", 0.05))),
+        ("mean_gas_pressure_rms_deviation_bar", "<=", float(getattr(cfg, "max_gas_pressure_rms_deviation_bar", 0.5))),
+    )
+    reasons: List[str] = []
+    for name, operator, threshold in checks:
+        if name not in metrics:
+            reasons.append(f"missing:{name}")
+            continue
+        value = float(metrics[name])
+        if not np.isfinite(value):
+            reasons.append(f"nonfinite:{name}={value!r}")
+        elif operator == "<=" and value > threshold:
+            reasons.append(f"{name}={value:.8g}>{threshold:.8g}")
+        elif operator == ">=" and value < threshold:
+            reasons.append(f"{name}={value:.8g}<{threshold:.8g}")
+    return not reasons, reasons
+
+
+def build_evaluation_metric_state(stats: Mapping[str, Any], cfg: TrainConfig) -> Dict[str, Any]:
+    """验证评估统计并构造可解释、阶段感知的安全指标状态。"""
+
+    if cfg.best_model_metric == "return":
+        value = float(stats.get("mean_return", float("nan")))
+        if not np.isfinite(value):
+            raise ValueError(f"mean_return={value!r} must be present and finite")
+        return {"metric": "return", "stage": cfg.training_stage, "feasible": True,
+                "solver_failures": 0.0, "hard_violation_rate": 0.0,
+                "maximum_violation": 0.0, "normalized_constraint_cost": 0.0,
+                "constraint_score": 0.0, "mean_return": value, "raw_stats": dict(stats)}
+
+    rate_names = (
+        "voltage_violation_rate", "gas_pressure_violation_rate", "line_overload_rate",
+        "pipe_velocity_violation_rate", "source_capacity_violation_rate", "soc_violation_rate",
+    )
+    maximum_names = (
+        "max_voltage_violation", "max_pressure_violation", "max_line_overload",
+        "max_pipe_velocity_violation", "max_source_capacity_violation",
+    )
+    cost_names = (
+        "voltage_violation_cost_per_step", "gas_pressure_violation_cost_per_step",
+        "line_overload_cost_per_step", "pipe_velocity_violation_cost_per_step",
+        "source_capacity_violation_cost_per_step",
+    )
+    required = [
+        "mean_return", "solver_failures", "power_solver_success_rate",
+        "gas_solver_success_rate", *rate_names, *maximum_names, *cost_names,
+    ]
+    missing = [name for name in required if name not in stats]
+    if missing:
+        raise ValueError(
+            f"Evaluation stats missing required safety fields for stage={cfg.training_stage!r}: {missing}"
+        )
+    values = {name: float(stats[name]) for name in required}
+    invalid = {name: value for name, value in values.items() if not np.isfinite(value)}
+    if invalid:
+        raise ValueError(f"Evaluation safety metrics must be finite; invalid={invalid}")
+    for name in ("solver_failures", *rate_names, *maximum_names, *cost_names):
+        if name in values and values[name] < 0.0:
+            raise ValueError(f"{name}={values[name]!r} must be non-negative")
+    for name in ("power_solver_success_rate", "gas_solver_success_rate", *rate_names):
+        if name in values and not 0.0 <= values[name] <= 1.0:
+            raise ValueError(f"{name}={values[name]!r} must be in [0,1]")
+
+    power_shortfall = max(0.0, float(getattr(cfg, "min_power_success_rate", 0.999))
+                              - values["power_solver_success_rate"])
+    gas_shortfall = max(0.0, float(getattr(cfg, "min_gas_success_rate", 0.999))
+                            - values["gas_solver_success_rate"])
+    violation_threshold = float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))
+    hard_violation_rate = max(values[name] for name in rate_names)
+    maximum_violation = max(values[name] for name in maximum_names)
+    normalized_constraint_cost = float(np.mean([values[name] for name in cost_names]))
+    constraint_score = float(np.mean([
+        power_shortfall, gas_shortfall, hard_violation_rate,
+        maximum_violation, normalized_constraint_cost,
+    ]))
+    feasible, feasibility_reasons = is_feasible(stats, cfg)
+    return {
+        "metric": cfg.best_model_metric,
+        "stage": cfg.training_stage,
+        "feasible": feasible,
+        "feasibility_reasons": feasibility_reasons,
+        "solver_failures": values["solver_failures"],
+        "hard_violation_rate": hard_violation_rate,
+        "maximum_violation": maximum_violation,
+        "normalized_constraint_cost": normalized_constraint_cost,
+        "constraint_score": constraint_score,
+        "mean_return": values["mean_return"],
+        "raw_stats": dict(stats),
+    }
+
+
+def compare_evaluation_metric(current: Mapping[str, Any], previous: Mapping[str, Any],
+                              tolerance: float = 1e-6) -> int:
+    """返回 1/0/-1；容差内的安全浮点差异交给下一指标和回报决定。"""
+
+    if bool(current["feasible"]) != bool(previous["feasible"]):
+        return 1 if bool(current["feasible"]) else -1
+    for name in ("solver_failures", "hard_violation_rate", "maximum_violation",
+                 "normalized_constraint_cost", "constraint_score"):
+        difference = float(current[name]) - float(previous[name])
+        if abs(difference) > tolerance:
+            return 1 if difference < 0.0 else -1
+    return_difference = float(current["mean_return"]) - float(previous["mean_return"])
+    if abs(return_difference) <= tolerance:
+        return 0
+    return 1 if return_difference > 0.0 else -1
+
+
+def evaluation_metric_key(stats: Mapping[str, Any], cfg: TrainConfig) -> Tuple[float, ...]:
+    state = build_evaluation_metric_state(stats, cfg)
+    return (float(state["feasible"]), -float(state["solver_failures"]),
+            -float(state["hard_violation_rate"]), -float(state["maximum_violation"]),
+            -float(state["normalized_constraint_cost"]), -float(state["constraint_score"]),
+            float(state["mean_return"]))
+
+
+def metric_state_from_evaluation(stats: Mapping[str, Any], cfg: TrainConfig) -> Dict[str, Any]:
+    return build_evaluation_metric_state(stats, cfg)
+
+
+def is_better_evaluation(stats: Mapping[str, Any], best_metric_state: Optional[Mapping[str, Any]],
+                         cfg: TrainConfig) -> bool:
+    current = build_evaluation_metric_state(stats, cfg)
+    if not best_metric_state:
+        return True
+    required = ("feasible", "solver_failures", "hard_violation_rate", "maximum_violation",
+                "normalized_constraint_cost", "constraint_score", "mean_return")
+    if any(name not in best_metric_state for name in required):
+        warnings.warn(
+            "Legacy best_metric_state has no explainable safety fields; the next valid evaluation replaces it.",
+            RuntimeWarning, stacklevel=2,
+        )
+        return True
+    tolerance = float(getattr(cfg, "metric_comparison_tolerance", 1e-6))
+    return compare_evaluation_metric(current, best_metric_state, tolerance) > 0
+
+
 def save_checkpoint(path: Path, cfg: TrainConfig, agents: AgentBundle, episode: int,
-                    global_step: int, best_return: float) -> None:
+                    global_step: int, best_return: float,
+                    best_metric_state: Optional[Mapping[str, Any]] = None,
+                    best_evaluation_stats: Optional[Mapping[str, Any]] = None,
+                    fast_replay: Optional[FastReplayBuffer] = None,
+                    slow_replay: Optional[SlowReplayBuffer] = None,
+                    manager_replay: Optional[ManagerReplayBuffer] = None,
+                    next_episode: Optional[int] = None,
+                    checkpoint_kind: str = "full_resume") -> None:
+    if checkpoint_kind not in ("lightweight", "full_resume"):
+        raise ValueError(f"checkpoint_kind={checkpoint_kind!r} must be lightweight or full_resume")
     path.parent.mkdir(parents=True, exist_ok=True)
+    full = checkpoint_kind == "full_resume"
+    lightweight_keys = {
+        "role", "encoder", "target_encoder", "actor", "target_actor", "critic",
+        "target_critic", "transition_model", "normalizer", "nonfinite_batch_count",
+    }
+
+    def agent_state(agent: Any) -> Dict[str, Any]:
+        state = agent.state_dict()
+        return state if full else {key: value for key, value in state.items() if key in lightweight_keys}
+
     payload = {
         **checkpoint_metadata(agents),
+        "checkpoint_kind": checkpoint_kind,
         "observation_dim": agents.manager.obs_dim,
         "config": asdict(cfg),
-        "manager": agents.manager.state_dict(),
-        "slow": agents.slow.state_dict(),
-        "fast": agents.fast.state_dict(),
+        "manager": agent_state(agents.manager),
+        "slow": agent_state(agents.slow),
+        "fast": agent_state(agents.fast),
         "episode": episode,
         "global_step": global_step,
         "best_return": best_return,
+        "best_metric_state": dict(best_metric_state or {}),
+        "best_evaluation_stats": dict(best_evaluation_stats or {}),
     }
-    torch.save(payload, str(path))
+    if full:
+        payload["next_episode"] = int(episode + 1 if next_episode is None else next_episode)
+        payload["rng_state"] = capture_rng_state()
+    if full and cfg.save_replay_in_checkpoint:
+        if fast_replay is None or slow_replay is None or manager_replay is None:
+            message = "full resume checkpoint requires all three Replay buffers"
+            if cfg.strict_resume_required:
+                raise ValueError(message)
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+        else:
+            payload.update({
+                "fast_replay": fast_replay.state_dict(),
+                "slow_replay": slow_replay.state_dict(),
+                "manager_replay": manager_replay.state_dict(),
+            })
+    elif full and not cfg.save_replay_in_checkpoint:
+        message = "Replay checkpointing is disabled; strict resume is unavailable"
+        if cfg.strict_resume_required:
+            raise ValueError(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    temp_path = path.with_name(path.name + f".tmp-{os.getpid()}-{time.time_ns()}")
+    started = time.perf_counter()
+    try:
+        torch.save(payload, str(temp_path))
+        os.replace(str(temp_path), str(path))
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    LOGGER.info("Checkpoint saved path=%s kind=%s size_bytes=%s elapsed_seconds=%.3f",
+                path, checkpoint_kind, path.stat().st_size, time.perf_counter() - started)
 
 
 def validate_checkpoint_compatibility(payload: Dict[str, Any], agents: AgentBundle) -> None:
@@ -1426,37 +2030,146 @@ def load_agent_policy_state(agent: Any, state: Dict[str, Any]) -> None:
     agent.actor.load_state_dict(state["actor"])
     hard_update(agent.target_encoder, agent.encoder)
     hard_update(agent.target_actor, agent.actor)
+    hard_update(agent.target_critic, agent.critic)
     if hasattr(agent, "normalizer") and "normalizer" in state:
         agent.normalizer.load_state_dict(state["normalizer"])
+    agent.total_updates = 0
+    if hasattr(agent, "critic_updates"):
+        agent.critic_updates = 0
+    if hasattr(agent, "actor_updates"):
+        agent.actor_updates = 0
+    if hasattr(agent, "_last_update_insertion_id"):
+        agent._last_update_insertion_id = 0
+
+
+def load_agent_stage_transfer_state(agent: Any, state: Dict[str, Any]) -> None:
+    """阶段传递保留表示、策略和 Critic 权重，但使用当前阶段新优化器和新 Replay。"""
+
+    for name in ("encoder", "target_encoder", "actor", "target_actor", "critic", "target_critic"):
+        getattr(agent, name).load_state_dict(state[name])
     transition_state = state.get("transition_model")
     if getattr(agent, "transition_model", None) is not None and transition_state is not None:
         agent.transition_model.load_state_dict(transition_state)
+    if "normalizer" in state:
+        agent.normalizer.load_state_dict(state["normalizer"])
     agent.total_updates = 0
+    if hasattr(agent, "critic_updates"):
+        agent.critic_updates = 0
+    if hasattr(agent, "actor_updates"):
+        agent.actor_updates = 0
+    if hasattr(agent, "_last_update_insertion_id"):
+        agent._last_update_insertion_id = 0
 
 
 # 【中文导读】按完整恢复或仅策略恢复两种模式载入 checkpoint。
 def load_checkpoint(path: str, agents: AgentBundle, map_location: torch.device,
-                    policy_only: bool = False) -> Dict[str, Any]:
+                    policy_only: bool = False, mode: Optional[str] = None,
+                    fast_replay: Optional[FastReplayBuffer] = None,
+                    slow_replay: Optional[SlowReplayBuffer] = None,
+                    manager_replay: Optional[ManagerReplayBuffer] = None) -> Dict[str, Any]:
     payload = trusted_torch_load(path, map_location=map_location)
     validate_checkpoint_compatibility(payload, agents)
-    if policy_only:
+    load_mode = mode or ("policy_only" if policy_only else "resume")
+    cfg = agents.fast.cfg
+    saved_stage = payload.get("training_stage", payload.get("config", {}).get("training_stage"))
+    if load_mode == "resume" and saved_stage is not None and saved_stage != cfg.training_stage:
+        raise ValueError(
+            f"Cannot resume checkpoint from training_stage={saved_stage!r} into "
+            f"training_stage={cfg.training_stage!r}; use checkpoint_load_mode='stage_transfer'."
+        )
+    if load_mode == "policy_only":
         load_agent_policy_state(agents.manager, payload["manager"])
         load_agent_policy_state(agents.slow, payload["slow"])
         load_agent_policy_state(agents.fast, payload["fast"])
+    elif load_mode == "stage_transfer":
+        load_agent_stage_transfer_state(agents.manager, payload["manager"])
+        load_agent_stage_transfer_state(agents.slow, payload["slow"])
+        load_agent_stage_transfer_state(agents.fast, payload["fast"])
+    elif load_mode == "resume":
+        required = ("fast_replay", "slow_replay", "manager_replay", "rng_state",
+                    "next_episode", "global_step", "manager", "slow", "fast")
+        missing = [name for name in required if name not in payload]
+        for role in ("manager", "slow", "fast"):
+            state = payload.get(role, {})
+            for optimizer_name in ("encoder_optim", "actor_optim", "critic_optim"):
+                if optimizer_name not in state:
+                    missing.append(f"{role}.{optimizer_name}")
+        payload["strict_resume_restored"] = not missing
+        payload["resume_missing_components"] = sorted(set(missing))
+        if missing and cfg.strict_resume_required:
+            raise ValueError("Strict resume checkpoint is missing: " + ", ".join(sorted(set(missing))))
+        if missing:
+            warnings.warn("Partial resume missing: " + ", ".join(sorted(set(missing))),
+                          RuntimeWarning, stacklevel=2)
+        for role, agent in (("manager", agents.manager), ("slow", agents.slow), ("fast", agents.fast)):
+            role_state = payload[role]
+            optimizer_names = ["encoder_optim", "actor_optim", "critic_optim"]
+            if role != "manager" and role_state.get("transition_model") is not None:
+                optimizer_names.append("transition_optim")
+            if all(name in role_state for name in optimizer_names):
+                agent.load_state_dict(role_state)
+            else:
+                load_agent_stage_transfer_state(agent, role_state)
+        replay_items = (
+            ("fast_replay", fast_replay), ("slow_replay", slow_replay),
+            ("manager_replay", manager_replay),
+        )
+        restored_all_replay = True
+        for key, replay in replay_items:
+            if replay is None or key not in payload:
+                restored_all_replay = False
+                continue
+            replay.load_state_dict(payload[key])
+        if not restored_all_replay:
+            warnings.warn(
+                "Checkpoint has no complete Replay state or buffers were not supplied; resume is not strict.",
+                RuntimeWarning, stacklevel=2,
+            )
+        if "rng_state" in payload:
+            restore_rng_state(payload["rng_state"])
+        else:
+            warnings.warn("Legacy checkpoint has no rng_state; stochastic continuation is not exact.",
+                          RuntimeWarning, stacklevel=2)
+        for agent, replay in ((agents.manager, manager_replay), (agents.slow, slow_replay),
+                              (agents.fast, fast_replay)):
+            if hasattr(agent, "_last_update_insertion_id"):
+                agent._last_update_insertion_id = int(
+                    replay.total_insertions if restored_all_replay and replay is not None else 0
+                )
     else:
-        agents.manager.load_state_dict(payload["manager"])
-        agents.slow.load_state_dict(payload["slow"])
-        agents.fast.load_state_dict(payload["fast"])
+        raise ValueError(f"checkpoint_load_mode must be resume, stage_transfer or policy_only, got {load_mode!r}")
     return payload
 
 
 # 【中文导读】在评估回报刷新时保存命名不同但内容完整的 checkpoint。
+STAGE_BEST_FILES = {
+    "fast_pretrain": "best_fast.pt",
+    "slow_pretrain": "best_slow.pt",
+    "manager_train": "best_manager.pt",
+    "joint_finetune": "best_joint.pt",
+}
+
+
 def save_best_files(root: Path, agents: AgentBundle, cfg: TrainConfig, episode: int,
-                    global_step: int, best_return: float) -> None:
-    save_checkpoint(root / "latest_checkpoint.pt", cfg, agents, episode, global_step, best_return)
-    save_checkpoint(root / "best_manager.pt", cfg, agents, episode, global_step, best_return)
-    save_checkpoint(root / "best_slow_worker.pt", cfg, agents, episode, global_step, best_return)
-    save_checkpoint(root / "best_fast_worker.pt", cfg, agents, episode, global_step, best_return)
+                    global_step: int, best_return: float,
+                    best_metric_state: Optional[Mapping[str, Any]] = None,
+                    best_evaluation_stats: Optional[Mapping[str, Any]] = None,
+                    fast_replay: Optional[FastReplayBuffer] = None,
+                    slow_replay: Optional[SlowReplayBuffer] = None,
+                    manager_replay: Optional[ManagerReplayBuffer] = None,
+                    next_episode: Optional[int] = None) -> None:
+    kwargs = {
+        "best_metric_state": best_metric_state,
+        "best_evaluation_stats": best_evaluation_stats,
+        "fast_replay": fast_replay, "slow_replay": slow_replay,
+        "manager_replay": manager_replay, "next_episode": next_episode,
+    }
+    filename = STAGE_BEST_FILES.get(cfg.training_stage)
+    if filename is None:
+        raise ValueError(f"Unknown training stage for best checkpoint: {cfg.training_stage!r}")
+    kwargs["checkpoint_kind"] = "lightweight"
+    save_checkpoint(root / "latest_policy.pt", cfg, agents, episode, global_step, best_return, **kwargs)
+    save_checkpoint(root / filename, cfg, agents, episode, global_step, best_return, **kwargs)
 
 
 # =============================================================================
@@ -1479,6 +2192,10 @@ class PendingFastTransition:
     projection: float
     goal: np.ndarray
     done: bool
+    reward_global_safety: float = 0.0
+    reward_role_specific: float = 0.0
+    reward_raw_total: float = 0.0
+    reward_component_clipped: float = 0.0
 
 
 # 【中文导读】累计一个慢动作保持区间内的折扣奖励、投影惩罚和持续步数。
@@ -1494,6 +2211,10 @@ class PendingSlowSegment:
     raw_action: np.ndarray
     executed_action: Optional[np.ndarray] = None
     discounted_reward: float = 0.0
+    discounted_global_safety_reward: float = 0.0
+    discounted_role_specific_reward: float = 0.0
+    discounted_raw_total_reward: float = 0.0
+    component_clipped_steps: int = 0
     projection_penalty_sum: float = 0.0
     duration_steps: int = 0
 
@@ -1504,9 +2225,21 @@ class PendingManagerSegment:
     """Manager 片段缓存，记录一个 goal 持续期间累计到的环境回报。"""
 
     obs_start: np.ndarray
-    goal: np.ndarray
+    goal: np.ndarray  # executed goal passed to both Workers
+    raw_goal: Optional[np.ndarray] = None
+    previous_executed_goal: Optional[np.ndarray] = None
     discounted_reward: float = 0.0
     duration_steps: int = 0
+    constraint_scores: List[float] = None  # type: ignore[assignment]
+    solver_failure_seen: bool = False
+
+    def __post_init__(self) -> None:
+        if self.raw_goal is None:
+            self.raw_goal = self.goal.copy()
+        if self.previous_executed_goal is None:
+            self.previous_executed_goal = np.zeros_like(self.goal)
+        if self.constraint_scores is None:
+            self.constraint_scores = []
 
 
 # 【中文导读】补齐快 transition 的 next_obs、next_goal 和内在奖励后写入经验池。
@@ -1569,19 +2302,19 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
 
     # 1) 创建环境和三个智能体。环境动作维度来自电-气系统设备数量。
     env = ElectricGasMultiScaleEnv()
+    env.unexpected_env_exception_policy = getattr(cfg, "unexpected_env_exception_policy", "raise")
     if env.slow_action_dim != 10 or env.fast_action_dim != 16 or env.action_dim != 26:
         LOGGER.warning("Expected slow=10 fast=16 action=26, got slow=%s fast=%s action=%s",
                        env.slow_action_dim, env.fast_action_dim, env.action_dim)
     agents = build_agents(env, cfg, device)
     loaded_best_return = -float("inf")
-    if cfg.load_checkpoint:
-        LOGGER.info("Loading checkpoint from %s", cfg.load_checkpoint)
-        payload = load_checkpoint(cfg.load_checkpoint, agents, device, policy_only=cfg.load_policy_only)
-        if cfg.load_policy_only:
-            LOGGER.info("Loaded policy/normalizer only; critics and optimizers are reinitialized for the current reward.")
-        else:
-            loaded_best = payload.get("best_return", -float("inf"))
-            loaded_best_return = float(loaded_best) if loaded_best is not None else -float("inf")
+    loaded_best_metric_state: Dict[str, Any] = {}
+    loaded_best_evaluation_stats: Dict[str, Any] = {}
+    loaded_global_step = 0
+    start_episode = 0
+    strict_resume_restored = False
+    resume_missing_components: List[str] = []
+    load_mode = getattr(cfg, "checkpoint_load_mode", "policy_only" if cfg.load_policy_only else "resume")
 
     # 2) 根据环境实际返回的观测维度创建三类经验池。
     obs, _ = env.reset(seed=cfg.seed)
@@ -1592,6 +2325,28 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     fast_buffer = FastReplayBuffer(cfg.fast_buffer_size, fast_dim, env.fast_action_dim, GOAL_DIM, device)
     slow_buffer = SlowReplayBuffer(cfg.slow_buffer_size, slow_dim, env.slow_action_dim, GOAL_DIM, device)
     manager_buffer = ManagerReplayBuffer(cfg.manager_buffer_size, manager_dim, GOAL_DIM, device)
+    if cfg.load_checkpoint:
+        LOGGER.info("Loading checkpoint from %s", cfg.load_checkpoint)
+        payload = load_checkpoint(
+            cfg.load_checkpoint, agents, device, mode=load_mode,
+            fast_replay=fast_buffer, slow_replay=slow_buffer, manager_replay=manager_buffer,
+        )
+        if load_mode == "resume":
+            strict_resume_restored = bool(payload.get("strict_resume_restored", False))
+            resume_missing_components = list(payload.get("resume_missing_components", []))
+            loaded_best = payload.get("best_return", -float("inf"))
+            loaded_best_return = float(loaded_best) if loaded_best is not None else -float("inf")
+            loaded_best_metric_state = dict(payload.get("best_metric_state", {}))
+            loaded_best_evaluation_stats = dict(payload.get("best_evaluation_stats", {}))
+            loaded_global_step = int(payload.get("global_step", 0))
+            start_episode = int(payload.get("next_episode", int(payload.get("episode", -1)) + 1))
+            LOGGER.info("Resumed complete training state at global_step=%s next_episode=%s.",
+                        loaded_global_step, start_episode)
+        elif load_mode == "stage_transfer":
+            LOGGER.info("Stage transfer loaded network/normalizer weights and retained Critic weights; "
+                        "optimizers, update counts, Replay, RNG, scheduling and stage best are reset.")
+        elif load_mode == "policy_only":
+            LOGGER.info("Loaded policy/normalizer only; critics, optimizers, targets, update counts, Replay, RNG and stage best are reset.")
 
     # 3) 准备日志、TensorBoard 和 checkpoint 目录。
     run_root = Path(cfg.checkpoint_dir) / time.strftime("%Y%m%d_%H%M%S")
@@ -1604,24 +2359,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
 
     train_flags = stage_flags(cfg.training_stage)
     best_eval_return = loaded_best_return if np.isfinite(loaded_best_return) else -float("inf")
-    global_step = 0
-    if cfg.load_checkpoint and cfg.load_policy_only:
-        initial_eval_stats = evaluate_policy(
-            agents, cfg, episodes=cfg.eval_episodes,
-            max_steps=min(cfg.episode_steps, EPISODE_STEPS), seed=cfg.seed + 10_000,
-        )
-        best_eval_return = initial_eval_stats["mean_return"]
-        save_best_files(run_root, agents, cfg, -1, global_step, best_eval_return)
-        with open(run_root / "initial_eval.json", "w", encoding="utf-8") as f:
-            json.dump(initial_eval_stats, f, indent=2, ensure_ascii=False)
-        LOGGER.info(
-            "Initial policy-only checkpoint eval %.3f saved as baseline best.",
-            best_eval_return,
-        )
-    elif cfg.load_checkpoint and np.isfinite(best_eval_return):
-        save_best_files(run_root, agents, cfg, -1, global_step, best_eval_return)
+    best_metric_state = loaded_best_metric_state
+    best_evaluation_stats = loaded_best_evaluation_stats
+    global_step = loaded_global_step
+    consecutive_solver_failure_episodes = 0
 
-    for episode in range(cfg.episodes):
+    for episode in range(start_episode, cfg.episodes):
         # 4) 一个 episode 表示一天调度。每个快速步是 3 分钟，默认 480 步。
         global_obs, info = env.reset(seed=cfg.seed + episode)
         builder = ObservationBuilder(env, cfg.manager_interval)
@@ -1638,21 +2381,29 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         voltage_rms_deviations: List[float] = []
         gas_pressure_rms_deviations: List[float] = []
         component_totals: Dict[str, float] = {}
-        worker_reward_clips = 0
+        interaction_reward_estimated_clips = 0
         manager_reward_clips = 0
+        episode_training_metrics: Dict[str, List[float]] = {}
+        episode_update_start = {
+            "fast": int(agents.fast.total_updates),
+            "slow": int(agents.slow.total_updates),
+            "manager": int(agents.manager.total_updates),
+        }
+        exploration_episode = int(cfg.exploration_episode_offset) + episode
         fast_noise = scheduled_noise(
             cfg.fast_exploration_noise, cfg.min_fast_exploration_noise,
-            episode, cfg.noise_decay_episodes)
+            exploration_episode, cfg.noise_decay_episodes)
         slow_noise = scheduled_noise(
             cfg.slow_exploration_noise, cfg.min_slow_exploration_noise,
-            episode, cfg.noise_decay_episodes)
+            exploration_episode, cfg.noise_decay_episodes)
         manager_noise = scheduled_noise(
             cfg.manager_exploration_noise, cfg.min_manager_exploration_noise,
-            episode, cfg.noise_decay_episodes)
+            exploration_episode, cfg.noise_decay_episodes)
         writer.add_scalar("exploration/fast_noise", fast_noise, episode)
         writer.add_scalar("exploration/slow_noise", slow_noise, episode)
         writer.add_scalar("exploration/manager_noise", manager_noise, episode)
         current_goal: Optional[np.ndarray] = None
+        current_raw_goal: Optional[np.ndarray] = None
         previous_goal: Optional[np.ndarray] = None
         held_slow_action = rule_slow_action(env)
         held_slow_action, _ = apply_ess_action_guard(env, held_slow_action, cfg, cfg.slow_interval)
@@ -1662,10 +2413,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         last_manager_step = 0
         done = False
 
-        for t in range(min(cfg.episode_steps, EPISODE_STEPS)):
+        for t in range(cfg.episode_steps):
             # 构造三层各自的观测。Manager 看全局，fast/slow 看更偏任务的局部摘要。
             manager_age = t - last_manager_step
-            manager_obs = builder.manager_obs(global_obs)
+            manager_obs = builder.manager_obs(global_obs, current_goal)
             fast_obs = builder.fast_obs(manager_age, global_obs)
             slow_obs = builder.slow_obs(global_obs)
 
@@ -1677,12 +2428,39 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                     manager_reward_clips += int(clipped)
                     manager_buffer.add(pending_manager.obs_start, manager_obs, pending_manager.goal,
                                        manager_reward, False,
-                                       pending_manager.duration_steps)
+                                       pending_manager.duration_steps,
+                                       float(np.mean(pending_manager.constraint_scores)) if pending_manager.constraint_scores else 0.0,
+                                       float(np.max(pending_manager.constraint_scores)) if pending_manager.constraint_scores else 0.0,
+                                       pending_manager.solver_failure_seen,
+                                       raw_goal=pending_manager.raw_goal,
+                                       previous_executed_goal=pending_manager.previous_executed_goal)
                 previous_goal = current_goal
                 if cfg.training_stage in ("fast_pretrain", "slow_pretrain"):
-                    current_goal = fixed_manager_goal()
+                    current_raw_goal = fixed_manager_goal()
+                    current_goal = current_raw_goal.copy()
+                elif manager_buffer.total_insertions < int(
+                        getattr(cfg, "manager_random_warmup_segments", 0)):
+                    random_goal = np.random.normal(0.0, 1.0, size=GOAL_DIM).astype(np.float32)
+                    current_raw_goal = normalize_goal_np(random_goal)
+                    actor_blend = warmup_actor_blend(
+                        manager_buffer.total_insertions,
+                        int(getattr(cfg, "manager_random_warmup_segments", 0)),
+                        float(getattr(cfg, "warmup_blend_fraction", 0.0)),
+                    )
+                    if actor_blend > 0.0:
+                        actor_raw_goal, _ = agents.manager.select_goal_pair(
+                            manager_obs, previous_goal, manager_noise, deterministic=False
+                        )
+                        current_raw_goal = normalize_goal_np(
+                            (1.0 - actor_blend) * current_raw_goal + actor_blend * actor_raw_goal
+                        )
+                    current_goal = execute_manager_goal_np(
+                        current_raw_goal,
+                        np.zeros(GOAL_DIM, dtype=np.float32) if previous_goal is None else previous_goal,
+                        cfg.goal_smoothing,
+                    )
                 else:
-                    current_goal = agents.manager.select_goal(
+                    current_raw_goal, current_goal = agents.manager.select_goal_pair(
                         manager_obs, previous_goal, manager_noise, deterministic=False)
                 if previous_goal is not None:
                     goal_change = float(np.mean(np.square(current_goal - previous_goal)))
@@ -1698,6 +2476,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                     )
                 pending_manager = PendingManagerSegment(
                     manager_obs.copy(), current_goal.copy(),
+                    raw_goal=current_raw_goal.copy(),
+                    previous_executed_goal=(
+                        np.zeros(GOAL_DIM, dtype=np.float32)
+                        if previous_goal is None else previous_goal.copy()
+                    ),
                     discounted_reward=initial_manager_reward,
                 )
                 last_manager_step = t
@@ -1708,9 +2491,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             if pending_fast is not None:
                 # 上一个快速步现在拥有 next_obs 了，可以入快 Worker buffer。
                 logs = finalize_fast_transition(pending_fast, fast_obs, current_goal, agents.fast, fast_buffer, cfg)
-                worker_reward_clips += int(logs.get("fast_reward_clipped", 0.0))
                 for k, v in logs.items():
-                    writer.add_scalar(f"reward/{k}", v, global_step)
+                    writer.add_scalar(k if k.startswith("interaction/") else f"reward/{k}", v, global_step)
                 pending_fast = None
 
             if t % cfg.slow_interval == 0:
@@ -1718,17 +2500,35 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 if pending_slow is not None:
                     logs = finalize_slow_segment(pending_slow, slow_obs, current_goal, agents.slow,
                                                  slow_buffer, cfg, False)
-                    worker_reward_clips += int(logs.get("slow_reward_clipped", 0.0))
                     for k, v in logs.items():
-                        writer.add_scalar(f"reward/{k}", v, global_step)
+                        writer.add_scalar(k if k.startswith("interaction/") else f"reward/{k}", v, global_step)
                 if cfg.training_stage == "fast_pretrain":
                     raw_slow_action = rule_slow_action(env)
+                elif slow_buffer.total_insertions < int(
+                        getattr(cfg, "slow_random_warmup_segments", 0)):
+                    warmup_slow_action = np.clip(
+                        rule_slow_action(env)
+                        + np.random.uniform(-0.05, 0.05, env.slow_action_dim).astype(np.float32),
+                        -1.0, 1.0,
+                    )
+                    actor_blend = warmup_actor_blend(
+                        slow_buffer.total_insertions,
+                        int(getattr(cfg, "slow_random_warmup_segments", 0)),
+                        float(getattr(cfg, "warmup_blend_fraction", 0.0)),
+                    )
+                    actor_slow_action = agents.slow.select_action(
+                        slow_obs, current_goal, slow_noise, deterministic=False
+                    )
+                    raw_slow_action = np.clip(
+                        (1.0 - actor_blend) * warmup_slow_action
+                        + actor_blend * actor_slow_action, -1.0, 1.0
+                    )
                 else:
                     raw_slow_action = agents.slow.select_action(
                         slow_obs, current_goal, slow_noise, deterministic=False)
                 horizon_steps = min(
                     max(1, cfg.slow_interval),
-                    max(1, min(cfg.episode_steps, EPISODE_STEPS) - t),
+                    max(1, cfg.episode_steps - t),
                 )
                 held_slow_action, guard_adjustment = apply_ess_action_guard(
                     env, raw_slow_action, cfg, horizon_steps
@@ -1737,7 +2537,23 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 writer.add_scalar("action/ess_guard_adjustment", guard_adjustment, global_step)
                 pending_slow = PendingSlowSegment(slow_obs.copy(), current_goal.copy(), held_slow_action.copy())
 
-            if cfg.training_stage in ("slow_pretrain", "manager_train"):
+            if (train_flags["fast"] and global_step < int(
+                    getattr(cfg, "fast_random_warmup_steps", 0))):
+                random_fast_action = np.random.uniform(
+                    -1.0, 1.0, env.fast_action_dim
+                ).astype(np.float32)
+                actor_blend = warmup_actor_blend(
+                    global_step, int(getattr(cfg, "fast_random_warmup_steps", 0)),
+                    float(getattr(cfg, "warmup_blend_fraction", 0.0)),
+                )
+                actor_fast_action = agents.fast.select_action(
+                    fast_obs, current_goal, fast_noise, deterministic=False
+                )
+                fast_action = np.clip(
+                    (1.0 - actor_blend) * random_fast_action
+                    + actor_blend * actor_fast_action, -1.0, 1.0
+                )
+            elif cfg.training_stage in ("slow_pretrain", "manager_train"):
                 # 预训练慢层/Manager 时，快层不加噪声，减少下层随机性对上层学习的干扰。
                 fast_action = agents.fast.select_action(fast_obs, current_goal, 0.0, deterministic=True)
             else:
@@ -1748,6 +2564,22 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             # 固定动作布局：[ESS(3), GFG(3), P2G(3), compressor(2), inverter-Q(8), curtailment(8)]。
             joint_action = np.concatenate([held_slow_action, fast_action]).astype(np.float32)
             next_global_obs, env_reward, terminated, truncated, info = safe_env_step(env, joint_action, global_obs)
+            time_limit_truncated = bool(
+                t + 1 >= cfg.episode_steps and not terminated and not truncated
+            )
+            if time_limit_truncated:
+                truncated = True
+                info["time_limit_truncated"] = True
+                if (getattr(cfg, "run_mode", "debug") != "formal"
+                        and t + 1 < env.config.time.steps_per_day):
+                    env_reward = apply_debug_terminal_soc_penalty(env, info, env_reward, cfg)
+            transition_done = bool(terminated or truncated)
+            if pending_manager is not None:
+                manager_constraint = float(info.get("_normalized_constraint_score", 0.0))
+                pending_manager.constraint_scores.append(manager_constraint)
+                pending_manager.solver_failure_seen = (
+                    pending_manager.solver_failure_seen or bool(info.get("solver_failed", False))
+                )
             applied = np.asarray(info.get("applied_action", np.clip(joint_action, -1.0, 1.0)), dtype=np.float32)
             raw = np.asarray(info.get("raw_action", joint_action), dtype=np.float32)
             projection_magnitude = float(info.get(
@@ -1759,8 +2591,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             action_projections.append(projection_magnitude)
             slow_action_projections.append(slow_projection_magnitude)
             fast_action_projections.append(fast_projection_magnitude)
-            fast_external = external_reward_from_components(info, FAST_COMPONENTS)
-            slow_external = external_reward_from_components(info, SLOW_COMPONENTS)
+            fast_reward_parts = worker_safety_reward_from_components(info, "fast", cfg)
+            slow_reward_parts = worker_safety_reward_from_components(info, "slow", cfg)
+            fast_external = fast_reward_parts["total"]
+            slow_external = slow_reward_parts["total"]
             slow_proj_pen = projection_penalty(raw[:env.slow_action_dim], applied[:env.slow_action_dim],
                                                cfg.lambda_projection)
             fast_proj_pen = projection_penalty(raw[env.slow_action_dim:], applied[env.slow_action_dim:],
@@ -1768,7 +2602,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             pending_fast = PendingFastTransition(
                 # 快 Worker 样本先 pending，到下一步拿到 next_fast_obs 后再写入 buffer。
                 fast_obs.copy(), fast_action.copy(), applied[env.slow_action_dim:].copy(),
-                fast_external, fast_proj_pen, current_goal.copy(), bool(terminated or truncated),
+                fast_external, fast_proj_pen, current_goal.copy(), transition_done,
+                reward_global_safety=fast_reward_parts["global_weighted"],
+                reward_role_specific=fast_reward_parts["role_weighted"],
+                reward_raw_total=fast_reward_parts["raw_total"],
+                reward_component_clipped=fast_reward_parts["component_clipped"],
             )
             if pending_slow is not None:
                 # 慢 Worker 的奖励跨多个快速步折扣累加，直到下一次慢动作或 episode 结束。
@@ -1776,6 +2614,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                     pending_slow.executed_action = applied[:env.slow_action_dim].copy()
                 # 片段内部按快速步折扣：R_seg = Σ gamma_fast^k * r_{t+k}。
                 pending_slow.discounted_reward += (cfg.gamma_fast ** pending_slow.duration_steps) * slow_external
+                pending_slow.discounted_global_safety_reward += (
+                    cfg.gamma_fast ** pending_slow.duration_steps
+                ) * slow_reward_parts["global_weighted"]
+                pending_slow.discounted_role_specific_reward += (
+                    cfg.gamma_fast ** pending_slow.duration_steps
+                ) * slow_reward_parts["role_weighted"]
+                pending_slow.discounted_raw_total_reward += (
+                    cfg.gamma_fast ** pending_slow.duration_steps
+                ) * slow_reward_parts["raw_total"]
+                pending_slow.component_clipped_steps += int(slow_reward_parts["component_clipped"])
                 pending_slow.projection_penalty_sum += (
                     cfg.gamma_fast ** pending_slow.duration_steps
                 ) * slow_proj_pen
@@ -1810,44 +2658,64 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             writer.add_scalar("solver/gas_solve_count", gas_solve_count, global_step)
 
             global_obs = next_global_obs
-            done = bool(terminated or truncated)
+            done = transition_done
             global_step += 1
 
             if global_step > cfg.learning_starts:
                 # learning_starts 之前只收集经验；之后按配置频率更新各层 TD3。
                 for _ in range(cfg.updates_per_step):
-                    if train_flags["fast"]:
-                        for k, v in agents.fast.update(fast_buffer, cfg.batch_size, cfg.gamma_fast).items():
-                            writer.add_scalar(f"loss/{k}", v, global_step)
-                    if train_flags["slow"] and global_step % max(1, cfg.slow_update_interval_steps) == 0:
-                        for k, v in agents.slow.update(slow_buffer, cfg.batch_size, cfg.gamma_slow).items():
-                            writer.add_scalar(f"loss/{k}", v, global_step)
-                    if train_flags["manager"] and global_step % max(1, cfg.manager_update_interval_steps) == 0:
-                        for k, v in agents.manager.update(manager_buffer, cfg.batch_size).items():
-                            writer.add_scalar(f"loss/{k}", v, global_step)
+                    if (train_flags["fast"] and global_step >= int(
+                            getattr(cfg, "fast_random_warmup_steps", 0))):
+                        update_logs = agents.fast.update(fast_buffer, cfg.batch_size, cfg.gamma_fast)
+                        for k, v in update_logs.items():
+                            writer.add_scalar(k if k.startswith("training_batch/") else f"loss/{k}", v, global_step)
+                            if np.isscalar(v) and np.isfinite(float(v)):
+                                episode_training_metrics.setdefault(k, []).append(float(v))
+                    if (train_flags["slow"]
+                            and slow_buffer.total_insertions >= int(
+                                getattr(cfg, "slow_random_warmup_segments", 0))
+                            and global_step % max(1, cfg.slow_update_interval_steps) == 0):
+                        update_logs = agents.slow.update(slow_buffer, cfg.batch_size, cfg.gamma_slow)
+                        for k, v in update_logs.items():
+                            writer.add_scalar(k if k.startswith("training_batch/") else f"loss/{k}", v, global_step)
+                            if np.isscalar(v) and np.isfinite(float(v)):
+                                episode_training_metrics.setdefault(k, []).append(float(v))
+                    if (train_flags["manager"]
+                            and manager_buffer.total_insertions >= int(
+                                getattr(cfg, "manager_random_warmup_segments", 0))
+                            and global_step % max(1, cfg.manager_update_interval_steps) == 0):
+                        update_logs = agents.manager.update(manager_buffer, cfg.batch_size)
+                        for k, v in update_logs.items():
+                            writer.add_scalar(k if k.startswith("training_batch/") else f"loss/{k}", v, global_step)
+                            if np.isscalar(v) and np.isfinite(float(v)):
+                                episode_training_metrics.setdefault(k, []).append(float(v))
 
             if done:
                 break
 
         # 5) episode 结束时，把还没入库的 pending 片段收尾。
-        final_manager_obs = builder.manager_obs(global_obs)
-        # 这里传入的是近似 manager_age；异常提前截断时可能与真实 t-last_manager_step 不一致。
-        final_fast_obs = builder.fast_obs(max(0, min(cfg.manager_interval, cfg.episode_steps)), global_obs)
-        final_slow_obs = builder.slow_obs(global_obs)
         if current_goal is None:
             current_goal = fixed_manager_goal()
+        final_manager_obs = builder.manager_obs(global_obs, current_goal)
+        # 这里传入的是近似 manager_age；异常提前截断时可能与真实 t-last_manager_step 不一致。
+        final_manager_age = max(0, min(cfg.manager_interval, (t + 1) - last_manager_step))
+        final_fast_obs = builder.fast_obs(final_manager_age, global_obs)
+        final_slow_obs = builder.slow_obs(global_obs)
         if pending_fast is not None:
             logs = finalize_fast_transition(pending_fast, final_fast_obs, current_goal, agents.fast, fast_buffer, cfg)
-            worker_reward_clips += int(logs.get("fast_reward_clipped", 0.0))
         if pending_slow is not None and pending_slow.duration_steps > 0:
             logs = finalize_slow_segment(pending_slow, final_slow_obs, current_goal, agents.slow, slow_buffer, cfg, done)
-            worker_reward_clips += int(logs.get("slow_reward_clipped", 0.0))
         if pending_manager is not None and pending_manager.duration_steps > 0:
             manager_reward, clipped = clip_reward_value(
                 pending_manager.discounted_reward, cfg.manager_reward_clip_abs)
             manager_reward_clips += int(clipped)
             manager_buffer.add(pending_manager.obs_start, final_manager_obs, pending_manager.goal,
-                               manager_reward, done, pending_manager.duration_steps)
+                               manager_reward, done, pending_manager.duration_steps,
+                               float(np.mean(pending_manager.constraint_scores)) if pending_manager.constraint_scores else 0.0,
+                               float(np.max(pending_manager.constraint_scores)) if pending_manager.constraint_scores else 0.0,
+                               pending_manager.solver_failure_seen,
+                               raw_goal=pending_manager.raw_goal,
+                               previous_executed_goal=pending_manager.previous_executed_goal)
 
         # 6) 汇总 episode 指标，用于日志、TensorBoard、CSV 和 checkpoint。
         mean_step_reward = float(np.mean(step_rewards)) if step_rewards else 0.0
@@ -1865,6 +2733,79 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         max_goal_change = float(np.max(goal_changes)) if goal_changes else 0.0
         mean_voltage_rms = float(np.mean(voltage_rms_deviations)) if voltage_rms_deviations else 0.0
         mean_gas_pressure_rms = float(np.mean(gas_pressure_rms_deviations)) if gas_pressure_rms_deviations else 0.0
+
+        def mean_training_metric(suffix: str) -> float:
+            values = [
+                value
+                for name, items in episode_training_metrics.items()
+                if name.endswith(suffix)
+                for value in items
+            ]
+            return float(np.mean(values)) if values else 0.0
+
+        update_deltas = {
+            "fast": int(agents.fast.total_updates) - episode_update_start["fast"],
+            "slow": int(agents.slow.total_updates) - episode_update_start["slow"],
+            "manager": int(agents.manager.total_updates) - episode_update_start["manager"],
+        }
+        nonfinite_batch_count = int(sum(
+            getattr(agent, "nonfinite_batch_count", 0)
+            for agent in (agents.fast, agents.slow, agents.manager)
+        ))
+        mean_target_q_clipping = mean_training_metric("target_q_clipping_ratio")
+        mean_reward_clipping = mean_training_metric("reward_clipping_ratio")
+        mean_action_saturation = mean_training_metric("actor_action_saturation_ratio")
+        mean_dynamic_projection_mse = mean_training_metric("dynamic_projection_mse")
+        writer.add_scalar("health/nonfinite_batch_count", nonfinite_batch_count, episode)
+        for role, count in update_deltas.items():
+            writer.add_scalar(f"health/{role}_updates_this_episode", count, episode)
+        for role, buffer in (("fast", fast_buffer), ("slow", slow_buffer), ("manager", manager_buffer)):
+            writer.add_scalar(f"health/{role}_replay_insertions", buffer.total_insertions, episode)
+        for role, agent in (("fast", agents.fast), ("slow", agents.slow), ("manager", agents.manager)):
+            writer.add_scalar(f"health/{role}_critic_updates_total",
+                              getattr(agent, "critic_updates", agent.total_updates), episode)
+            writer.add_scalar(f"health/{role}_actor_updates_total",
+                              getattr(agent, "actor_updates", 0), episode)
+            writer.add_scalar(f"health/{role}_normalizer_count", agent.normalizer.count, episode)
+            writer.add_scalar(f"health/{role}_normalizer_mean_abs",
+                              float(np.mean(np.abs(agent.normalizer.mean))), episode)
+            writer.add_scalar(f"health/{role}_normalizer_variance_mean",
+                              float(np.mean(agent.normalizer.var)), episode)
+        writer.add_scalar("health/mean_target_q_clipping_ratio", mean_target_q_clipping, episode)
+        writer.add_scalar("health/mean_reward_clipping_ratio", mean_reward_clipping, episode)
+        writer.add_scalar("health/mean_actor_action_saturation_ratio", mean_action_saturation, episode)
+        writer.add_scalar("health/mean_dynamic_projection_rms",
+                          math.sqrt(max(mean_dynamic_projection_mse, 0.0)), episode)
+
+        patience = int(getattr(cfg, "health_warning_patience_episodes", 3))
+        consecutive_solver_failure_episodes = (
+            consecutive_solver_failure_episodes + 1 if solver_failures > 0 else 0
+        )
+        if consecutive_solver_failure_episodes >= patience:
+            LOGGER.warning("Solver failures occurred for %s consecutive episodes.",
+                           consecutive_solver_failure_episodes)
+        role_buffers = {"fast": fast_buffer, "slow": slow_buffer, "manager": manager_buffer}
+        role_starts = {
+            "fast": int(getattr(cfg, "fast_learning_starts", 0)),
+            "slow": int(getattr(cfg, "slow_learning_starts", 0)),
+            "manager": int(getattr(cfg, "manager_learning_starts", 0)),
+        }
+        for role, active in train_flags.items():
+            if active and len(role_buffers[role]) >= role_starts[role] and update_deltas[role] == 0:
+                LOGGER.warning("%s is trainable with sufficient Replay data but made no updates in episode %s.",
+                               role, episode)
+        clip_limit = float(getattr(cfg, "health_clip_warning_ratio", 0.20))
+        if max(mean_target_q_clipping, mean_reward_clipping) > clip_limit:
+            LOGGER.warning("Training clipping ratio exceeded %.3f in episode %s (target_q=%.3f reward=%.3f).",
+                           clip_limit, episode, mean_target_q_clipping, mean_reward_clipping)
+        saturation_limit = float(getattr(cfg, "health_action_saturation_warning_ratio", 0.90))
+        if mean_action_saturation > saturation_limit:
+            LOGGER.warning("Actor action saturation ratio %.3f exceeded %.3f in episode %s.",
+                           mean_action_saturation, saturation_limit, episode)
+        projection_limit = float(getattr(cfg, "health_projection_warning_rms", 0.25))
+        if math.sqrt(max(mean_dynamic_projection_mse, 0.0)) > projection_limit:
+            LOGGER.warning("Dynamic projection RMS %.3f exceeded %.3f in episode %s.",
+                           math.sqrt(max(mean_dynamic_projection_mse, 0.0)), projection_limit, episode)
         writer.add_scalar("episode/return", episode_return, episode)
         writer.add_scalar("episode/manager_return", manager_return, episode)
         writer.add_scalar("episode/fast_buffer_size", len(fast_buffer), episode)
@@ -1880,7 +2821,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         writer.add_scalar("episode/max_ess_action_guard", max_ess_guard, episode)
         writer.add_scalar("episode/mean_voltage_rms_deviation_pu", mean_voltage_rms, episode)
         writer.add_scalar("episode/mean_gas_pressure_rms_deviation_bar", mean_gas_pressure_rms, episode)
-        writer.add_scalar("episode/worker_reward_clips", worker_reward_clips, episode)
+        writer.add_scalar("episode/interaction_reward_estimated_clips",
+                          interaction_reward_estimated_clips, episode)
         writer.add_scalar("episode/manager_reward_clips", manager_reward_clips, episode)
         LOGGER.info("Episode %s return %.3f | buffers fast=%s slow=%s manager=%s | failures=%s",
                     episode, episode_return, len(fast_buffer), len(slow_buffer), len(manager_buffer),
@@ -1893,7 +2835,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         eval_mean_voltage_rms: Any = ""
         eval_mean_gas_pressure_rms: Any = ""
         if (episode + 1) % max(1, cfg.eval_interval) == 0 or episode == cfg.episodes - 1:
-            eval_stats = evaluate_policy(agents, cfg, episodes=cfg.eval_episodes, max_steps=min(cfg.episode_steps, EPISODE_STEPS),
+            eval_stats = evaluate_policy(agents, cfg, episodes=cfg.eval_episodes, max_steps=cfg.episode_steps,
                                          seed=cfg.seed + 10_000 + episode)
             eval_return = eval_stats["mean_return"]
             eval_solver_failures = eval_stats["solver_failures"]
@@ -1909,10 +2851,29 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                               eval_stats["mean_voltage_rms_deviation_pu"], episode)
             writer.add_scalar("eval/mean_gas_pressure_rms_deviation_bar",
                               eval_stats["mean_gas_pressure_rms_deviation_bar"], episode)
-            if eval_stats["mean_return"] > best_eval_return:
+            if is_better_evaluation(eval_stats, best_metric_state, cfg):
                 best_eval_return = eval_stats["mean_return"]
-                save_best_files(run_root, agents, cfg, episode, global_step, best_eval_return)
-        save_checkpoint(run_root / "latest_checkpoint.pt", cfg, agents, episode, global_step, best_eval_return)
+                best_metric_state = metric_state_from_evaluation(eval_stats, cfg)
+                best_evaluation_stats = dict(eval_stats)
+                save_best_files(
+                    run_root, agents, cfg, episode, global_step, best_eval_return,
+                    best_metric_state, best_evaluation_stats,
+                    fast_buffer, slow_buffer, manager_buffer, episode + 1,
+                )
+        save_checkpoint(
+            run_root / "latest_policy.pt", cfg, agents, episode, global_step, best_eval_return,
+            best_metric_state, best_evaluation_stats,
+            fast_buffer, slow_buffer, manager_buffer, episode + 1,
+            checkpoint_kind="lightweight",
+        )
+        if ((episode + 1) % int(cfg.full_resume_checkpoint_interval) == 0
+                or episode == cfg.episodes - 1):
+            save_checkpoint(
+                run_root / "resume_latest.pt", cfg, agents, episode, global_step, best_eval_return,
+                best_metric_state, best_evaluation_stats,
+                fast_buffer, slow_buffer, manager_buffer, episode + 1,
+                checkpoint_kind="full_resume",
+            )
         csv_logger.write({
             "stage": cfg.training_stage,
             "episode": episode,
@@ -1953,19 +2914,99 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             "pipe_velocity_violation_cost": component_totals.get("pipe_velocity_violation", 0.0),
             "source_capacity_violation_cost": component_totals.get("source_capacity_violation", 0.0),
             "gas_purchase_cost": component_totals.get("gas_purchase", 0.0),
-            "worker_reward_clips": worker_reward_clips,
+            "interaction_reward_estimated_clips": interaction_reward_estimated_clips,
             "manager_reward_clips": manager_reward_clips,
+            "fast_total_insertions": fast_buffer.total_insertions,
+            "slow_total_insertions": slow_buffer.total_insertions,
+            "manager_total_insertions": manager_buffer.total_insertions,
+            "fast_update_count": agents.fast.total_updates,
+            "slow_update_count": agents.slow.total_updates,
+            "manager_update_count": agents.manager.total_updates,
+            "fast_actor_update_count": getattr(agents.fast, "actor_updates", 0),
+            "slow_actor_update_count": getattr(agents.slow, "actor_updates", 0),
+            "manager_actor_update_count": getattr(agents.manager, "actor_updates", 0),
+            "fast_critic_update_count": getattr(agents.fast, "critic_updates", agents.fast.total_updates),
+            "slow_critic_update_count": getattr(agents.slow, "critic_updates", agents.slow.total_updates),
+            "manager_critic_update_count": getattr(agents.manager, "critic_updates", agents.manager.total_updates),
+            "nonfinite_batch_count": nonfinite_batch_count,
+            "fast_normalizer_count": agents.fast.normalizer.count,
+            "slow_normalizer_count": agents.slow.normalizer.count,
+            "manager_normalizer_count": agents.manager.normalizer.count,
+            "mean_target_q_clipping_ratio": mean_target_q_clipping,
+            "mean_reward_clipping_ratio": mean_reward_clipping,
+            "mean_actor_action_saturation_ratio": mean_action_saturation,
         })
 
     writer.close()
     LOGGER.info("Training complete. Checkpoints: %s", run_root)
+    fast_last = (fast_buffer.idx - 1) % fast_buffer.capacity if len(fast_buffer) else None
+    slow_last = (slow_buffer.idx - 1) % slow_buffer.capacity if len(slow_buffer) else None
+    manager_last = (manager_buffer.idx - 1) % manager_buffer.capacity if len(manager_buffer) else None
     return {
         "run_root": str(run_root),
         "global_step": global_step,
+        "next_episode": start_episode if cfg.episodes <= start_episode else cfg.episodes,
         "best_eval_return": best_eval_return,
+        "best_metric_state": best_metric_state,
+        "best_evaluation_stats": best_evaluation_stats,
         "fast_buffer_size": len(fast_buffer),
         "slow_buffer_size": len(slow_buffer),
         "manager_buffer_size": len(manager_buffer),
+        "fast_total_insertions": int(fast_buffer.total_insertions),
+        "slow_total_insertions": int(slow_buffer.total_insertions),
+        "manager_total_insertions": int(manager_buffer.total_insertions),
+        "fast_last_duration": float(fast_buffer.duration_steps[fast_last, 0]) if fast_last is not None else 0.0,
+        "slow_last_duration": float(slow_buffer.duration_steps[slow_last, 0]) if slow_last is not None else 0.0,
+        "manager_last_duration": float(manager_buffer.duration_steps[manager_last, 0]) if manager_last is not None else 0.0,
+        "fast_last_done": float(fast_buffer.dones[fast_last, 0]) if fast_last is not None else 0.0,
+        "slow_last_done": float(slow_buffer.dones[slow_last, 0]) if slow_last is not None else 0.0,
+        "manager_last_done": float(manager_buffer.dones[manager_last, 0]) if manager_last is not None else 0.0,
+        "strict_resume_restored": strict_resume_restored,
+        "resume_missing_components": resume_missing_components,
+        "fast_update_count": int(agents.fast.total_updates),
+        "slow_update_count": int(agents.slow.total_updates),
+        "manager_update_count": int(agents.manager.total_updates),
+        "fast_actor_update_count": int(getattr(agents.fast, "actor_updates", 0)),
+        "slow_actor_update_count": int(getattr(agents.slow, "actor_updates", 0)),
+        "manager_actor_update_count": int(getattr(agents.manager, "actor_updates", 0)),
+        "fast_critic_update_count": int(getattr(agents.fast, "critic_updates", agents.fast.total_updates)),
+        "slow_critic_update_count": int(getattr(agents.slow, "critic_updates", agents.slow.total_updates)),
+        "manager_critic_update_count": int(getattr(agents.manager, "critic_updates", agents.manager.total_updates)),
+        "nonfinite_batch_count": int(sum(
+            getattr(agent, "nonfinite_batch_count", 0)
+            for agent in (agents.fast, agents.slow, agents.manager)
+        )),
+        "slow_last_guarded_action": (
+            slow_buffer.guarded_actions[slow_last].copy()
+            if slow_last is not None and hasattr(slow_buffer, "guarded_actions") else None
+        ),
+        "slow_last_discounted_mean_executed_action": (
+            slow_buffer.executed_actions[slow_last].copy() if slow_last is not None else None
+        ),
+        "slow_last_executed_action_variance": (
+            slow_buffer.executed_action_variance[slow_last].copy()
+            if slow_last is not None and hasattr(slow_buffer, "executed_action_variance") else None
+        ),
+        "slow_last_max_dynamic_projection": (
+            float(slow_buffer.max_dynamic_projection[slow_last, 0])
+            if slow_last is not None and hasattr(slow_buffer, "max_dynamic_projection") else 0.0
+        ),
+        "manager_last_constraint_mean": (
+            float(manager_buffer.segment_constraint_mean[manager_last, 0])
+            if manager_last is not None and hasattr(manager_buffer, "segment_constraint_mean") else 0.0
+        ),
+        "manager_last_constraint_max": (
+            float(manager_buffer.segment_constraint_max[manager_last, 0])
+            if manager_last is not None and hasattr(manager_buffer, "segment_constraint_max") else 0.0
+        ),
+        "manager_last_solver_failure_seen": (
+            bool(manager_buffer.solver_failure_seen[manager_last, 0])
+            if manager_last is not None and hasattr(manager_buffer, "solver_failure_seen") else False
+        ),
+        "manager_last_priority": (
+            float(manager_buffer.priorities[manager_last])
+            if manager_last is not None and hasattr(manager_buffer, "priorities") else 0.0
+        ),
     }
 
 
@@ -1987,12 +3028,27 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
     agents.slow.normalizer.eval()
     agents.fast.normalizer.eval()
     env = ElectricGasMultiScaleEnv()
+    env.unexpected_env_exception_policy = getattr(cfg, "unexpected_env_exception_policy", "raise")
     returns: List[float] = []
     solver_failures = 0
     power_ok = 0
     gas_ok = 0
+    soc_violation_steps = 0
     step_count = 0
     component_totals: Dict[str, float] = {}
+    component_violation_steps: Dict[str, int] = {}
+    hard_violation_steps = {
+        "voltage": 0, "gas_pressure": 0, "line_overload": 0,
+        "pipe_velocity": 0, "source_capacity": 0, "soc": 0,
+    }
+    extrema = {
+        "min_voltage_pu": float("inf"), "max_voltage_pu": -float("inf"),
+        "max_line_loading_percent": 0.0, "min_gas_pressure_bar": float("inf"),
+        "max_gas_pressure_bar": -float("inf"), "max_pipe_velocity_m_per_s": 0.0,
+        "max_voltage_violation": 0.0, "max_pressure_violation": 0.0,
+        "max_line_overload": 0.0, "max_pipe_velocity_violation": 0.0,
+        "max_source_capacity_violation": 0.0,
+    }
     voltage_rms_deviations: List[float] = []
     gas_pressure_rms_deviations: List[float] = []
     try:
@@ -2007,7 +3063,7 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
             ep_return = 0.0
             for t in range(max_steps):
                 manager_age = t - last_manager_step
-                manager_obs = builder.manager_obs(global_obs)
+                manager_obs = builder.manager_obs(global_obs, current_goal)
                 if t % cfg.manager_interval == 0:
                     if cfg.training_stage in ("fast_pretrain", "slow_pretrain"):
                         current_goal = fixed_manager_goal()
@@ -2031,20 +3087,72 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
                         )
                     horizon_steps = min(
                         max(1, cfg.slow_interval),
-                        max(1, min(max_steps, EPISODE_STEPS) - t),
+                        max(1, max_steps - t),
                     )
                     held_slow_action, _ = apply_ess_action_guard(env, raw_slow_action, cfg, horizon_steps)
                 fast_action = agents.fast.select_action(fast_obs, current_goal, 0.0, deterministic=True)
                 joint_action = np.concatenate([held_slow_action, fast_action]).astype(np.float32)
                 global_obs, reward, terminated, truncated, info = safe_env_step(env, joint_action, global_obs)
+                if (t + 1 >= max_steps and not terminated and not truncated
+                        and max_steps < env.config.time.steps_per_day):
+                    truncated = True
+                    info["time_limit_truncated"] = True
+                    reward = apply_debug_terminal_soc_penalty(env, info, reward, cfg)
                 comps = info.get("reward_components", {})
                 metrics = info.get("constraint_metrics", {})
                 for key, value in comps.items():
                     component_totals[key] = component_totals.get(key, 0.0) + float(value)
+                    component_violation_steps[key] = component_violation_steps.get(key, 0) + int(
+                        abs(float(value)) > 1e-12
+                    )
                 if "voltage_rms_deviation_pu" in metrics:
                     voltage_rms_deviations.append(float(metrics["voltage_rms_deviation_pu"]))
                 if "gas_pressure_rms_deviation_bar" in metrics:
                     gas_pressure_rms_deviations.append(float(metrics["gas_pressure_rms_deviation_bar"]))
+                soc_min = float(metrics.get("soc_min", 0.5))
+                soc_max = float(metrics.get("soc_max", 0.5))
+                soc_violation_steps += int(
+                    soc_min < min(item.soc_min for item in ESS_CONFIGS)
+                    or soc_max > max(item.soc_max for item in ESS_CONFIGS)
+                )
+                vm_min = float(metrics.get("vm_min_pu", 1.0))
+                vm_max = float(metrics.get("vm_max_pu", 1.0))
+                pressure_min = float(metrics.get("gas_pressure_min_bar", env.config.gas.network_pressure_target_bar))
+                pressure_max = float(metrics.get("gas_pressure_max_bar", env.config.gas.network_pressure_target_bar))
+                line_max = float(metrics.get("max_line_loading_percent", 0.0))
+                pipe_max = float(metrics.get("max_pipe_velocity_m_per_s", 0.0))
+                source_values = np.nan_to_num(np.asarray(
+                    metrics.get("source_capacity_violation_kg_s", []), dtype=np.float64
+                ).reshape(-1), nan=0.0, posinf=float("inf"), neginf=0.0)
+                source_max = float(np.max(source_values)) if source_values.size else 0.0
+                voltage_violation = max(env.config.power.voltage_min_pu - vm_min, 0.0,
+                                        vm_max - env.config.power.voltage_max_pu)
+                pressure_violation = max(env.config.gas.network_pressure_min_bar - pressure_min, 0.0,
+                                         pressure_max - env.config.gas.network_pressure_max_bar)
+                line_violation = max(line_max - env.config.power.max_line_loading_percent, 0.0)
+                pipe_violation = max(pipe_max - env.config.gas.max_pipe_velocity_m_per_s, 0.0)
+                hard_violation_steps["voltage"] += int(voltage_violation > 0.0)
+                hard_violation_steps["gas_pressure"] += int(pressure_violation > 0.0)
+                hard_violation_steps["line_overload"] += int(line_violation > 0.0)
+                hard_violation_steps["pipe_velocity"] += int(pipe_violation > 0.0)
+                hard_violation_steps["source_capacity"] += int(source_max > 0.0)
+                hard_violation_steps["soc"] += int(
+                    soc_min < min(item.soc_min for item in ESS_CONFIGS)
+                    or soc_max > max(item.soc_max for item in ESS_CONFIGS)
+                )
+                extrema["min_voltage_pu"] = min(extrema["min_voltage_pu"], vm_min)
+                extrema["max_voltage_pu"] = max(extrema["max_voltage_pu"], vm_max)
+                extrema["max_line_loading_percent"] = max(extrema["max_line_loading_percent"], line_max)
+                extrema["min_gas_pressure_bar"] = min(extrema["min_gas_pressure_bar"], pressure_min)
+                extrema["max_gas_pressure_bar"] = max(extrema["max_gas_pressure_bar"], pressure_max)
+                extrema["max_pipe_velocity_m_per_s"] = max(extrema["max_pipe_velocity_m_per_s"], pipe_max)
+                extrema["max_voltage_violation"] = max(extrema["max_voltage_violation"], voltage_violation)
+                extrema["max_pressure_violation"] = max(extrema["max_pressure_violation"], pressure_violation)
+                extrema["max_line_overload"] = max(extrema["max_line_overload"], line_violation)
+                extrema["max_pipe_velocity_violation"] = max(extrema["max_pipe_velocity_violation"], pipe_violation)
+                extrema["max_source_capacity_violation"] = max(
+                    extrema["max_source_capacity_violation"], source_max
+                )
                 ep_return += float(reward)
                 solver_failures += int(bool(info.get("solver_failed", False)))
                 power_ok += int(bool(info.get("power_converged", False)))
@@ -2061,12 +3169,15 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
         if previous_modes[2]:
             agents.fast.normalizer.train()
     denom = max(step_count, 1)
-    return {
+    result = {
         "mean_return": float(np.mean(returns)),
         "std_return": float(np.std(returns)),
         "solver_failures": float(solver_failures),
         "power_success_rate": float(power_ok / denom),
         "gas_success_rate": float(gas_ok / denom),
+        "power_solver_success_rate": float(power_ok / denom),
+        "gas_solver_success_rate": float(gas_ok / denom),
+        "soc_violation_rate": float(soc_violation_steps / denom),
         "steps": float(step_count),
         "mean_voltage_rms_deviation_pu": float(np.mean(voltage_rms_deviations)) if voltage_rms_deviations else 0.0,
         "mean_gas_pressure_rms_deviation_bar": float(np.mean(gas_pressure_rms_deviations)) if gas_pressure_rms_deviations else 0.0,
@@ -2078,6 +3189,19 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
         "source_capacity_violation_cost": float(component_totals.get("source_capacity_violation", 0.0)),
         "gas_purchase_cost": float(component_totals.get("gas_purchase", 0.0)),
     }
+    for key, value in hard_violation_steps.items():
+        result[key + "_violation_rate"] = float(value / denom)
+    result["line_overload_rate"] = result.pop("line_overload_violation_rate")
+    for key, value in extrema.items():
+        result[key] = float(value if np.isfinite(value) else 0.0)
+    for key, total in component_totals.items():
+        result[key + "_cost_total"] = float(total)
+        result[key + "_cost_per_step"] = float(total / denom)
+        result[key + "_violation_rate"] = float(component_violation_steps.get(key, 0) / denom)
+    feasible, feasibility_reasons = is_feasible(result, cfg)
+    result["constraint_feasibility"] = float(feasible)
+    result["feasibility_reasons"] = feasibility_reasons
+    return result
 
 
 # =============================================================================
@@ -2355,7 +3479,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--eval-episodes", type=int, default=1)
     parser.add_argument("--checkpoint-dir", type=str, default="hierarchical_td3_runs")
     parser.add_argument("--load-checkpoint", type=str, default="")
+    parser.add_argument("--checkpoint-load-mode", choices=("resume", "stage_transfer", "policy_only"),
+                        default="resume")
     parser.add_argument("--load-policy-only", action="store_true")
+    parser.add_argument("--best-model-metric", choices=("feasible_then_return", "return"),
+                        default="feasible_then_return")
     parser.add_argument("--use-transition-model", action="store_true")
     parser.add_argument("--fast-exploration-noise", type=float, default=0.15)
     parser.add_argument("--slow-exploration-noise", type=float, default=0.10)
@@ -2376,6 +3504,8 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument("--run-tests", action="store_true")
     args = parser.parse_args()
+    if args.load_policy_only:
+        args.checkpoint_load_mode = "policy_only"
     cfg = TrainConfig(
         seed=args.seed,
         episodes=args.episodes,
@@ -2406,6 +3536,8 @@ def parse_args() -> TrainConfig:
         checkpoint_dir=args.checkpoint_dir,
         load_checkpoint=args.load_checkpoint,
         load_policy_only=args.load_policy_only,
+        checkpoint_load_mode=args.checkpoint_load_mode,
+        best_model_metric=args.best_model_metric,
         use_transition_model=args.use_transition_model,
         fast_exploration_noise=args.fast_exploration_noise,
         slow_exploration_noise=args.slow_exploration_noise,
@@ -2440,24 +3572,27 @@ def run_all_stages(cfg: TrainConfig) -> Dict[str, Any]:
     counts = [max(1, c) for c in counts]#储存了每个阶段的训练轮数
     all_root = Path(cfg.checkpoint_dir) / ("all_stages_" + time.strftime("%Y%m%d_%H%M%S"))
     previous_checkpoint = cfg.load_checkpoint#上一阶段checkpoint
-    initial_checkpoint = cfg.load_checkpoint#初始checkpoint
     results: Dict[str, Any] = {"stages": []}
+    completed_stages = 0
     for stage, count in zip(stages, counts):#zip把stages和counts对应起来，stages是训练状态，counts是训练轮数
         stage_cfg = copy.deepcopy(cfg)
         stage_cfg.training_stage = stage
         stage_cfg.episodes = count
         stage_cfg.checkpoint_dir = str(all_root / stage)#储存快照地址
         stage_cfg.load_checkpoint = previous_checkpoint
-        stage_cfg.load_policy_only = bool(
-            cfg.load_policy_only and initial_checkpoint and previous_checkpoint == initial_checkpoint
-        )
+        if previous_checkpoint:
+            stage_cfg.checkpoint_load_mode = (
+                cfg.checkpoint_load_mode if completed_stages == 0 else "stage_transfer"
+            )
+        stage_cfg.load_policy_only = stage_cfg.checkpoint_load_mode == "policy_only"
         LOGGER.info("Starting stage %s for %s episode(s).", stage, count)
         result = run_training(stage_cfg)
         result["stage"] = stage
         results["stages"].append(result)
         run_root = Path(result["run_root"])
-        best_checkpoint = run_root / "best_manager.pt"
-        previous_checkpoint = str(best_checkpoint if best_checkpoint.exists() else run_root / "latest_checkpoint.pt")
+        best_checkpoint = run_root / STAGE_BEST_FILES[stage]
+        previous_checkpoint = str(best_checkpoint if best_checkpoint.exists() else run_root / "latest_policy.pt")
+        completed_stages += 1
     results["latest_checkpoint"] = previous_checkpoint
     return results
 
