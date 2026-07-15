@@ -1,26 +1,32 @@
-"""Hierarchical TD3 for the electric-gas multi-scale microgrid environment.
+"""分层 TD3 的基础实现与兼容模块（中文注释版）。
 
-The simulator is imported from ``electric_gas_microgrid_single.py``.  This file
-only implements the learning system: Manager, slow Worker, fast Worker,
-asynchronous replay semantics, normalization, checkpointing and lightweight
-tests.
+【文件在项目中的作用】
+本文件集中给出 Manager、Slow Worker、Fast Worker 的基础网络、Replay Buffer、
+观测构造、奖励组合、checkpoint、评估以及多时间尺度训练主循环。它也是优化版
+``hierarchical_td3_electric_gas_optimized.py`` 复用的兼容层；优化版通过受控的
+runtime override 替换 PER Replay、物理目标、投影感知 transition 和严格恢复逻辑。
 
-初学者阅读路线：
-1. 先看 ``TrainConfig``，理解一个 episode 有多少步、三个智能体多久决策一次。
-2. 再看 ``ManagerTD3`` 和 ``WorkerTD3``，它们都是 TD3，只是动作含义不同：
-   Manager 输出 goal，Worker 输出环境动作。
-3. 接着看 ``Pending*`` 和 ``run_training``，这是多时间尺度最核心的部分：
-   快 Worker 每步入库，慢 Worker 每小时聚合一次，Manager 每约两小时聚合一次。
-4. 最后看 ``evaluate_policy`` 与 CLI，它们负责加载 checkpoint 和无探索评估。
+【与环境文件的关系】
+``electric_gas_microgrid_single.py`` 定义电网/气网拓扑、设备参数、状态、动作映射、
+安全投影和物理求解。本文件只消费环境接口，不复制或改变物理模型。一个快速步为
+3 分钟，Slow 每 20 步决策一次，Manager 每 40 步给出一次 goal，正式 episode 为
+480 步（24 小时）。
 
-Typical quick check:
+【正式训练入口】
+本文件用于理解基础 TD3 和提供兼容 API；正式训练请运行
+``hierarchical_td3_electric_gas_optimized.py``。基础文件的正式/调试训练入口按项目
+契约被禁用，避免误用旧实现。
 
-    & 'D:\\anaconda\\anaconda\\envs\\python_3_8\\python.exe' hierarchical_td3_electric_gas.py --run-tests
+【初学者推荐阅读顺序】
+TrainConfig → ObservationBuilder → Actor/Critic → Replay Buffer → ManagerTD3/
+WorkerTD3 → Pending* → run_training → evaluate_policy/checkpoint。
 
-Formal/debug training is intentionally disabled in this compatibility module.
-Use the single supported training entry point:
+【基础 TD3 与项目扩展】
+Actor、双 Critic、target policy smoothing、delayed policy update、soft update 属于
+TD3 基础；Manager goal、20/40 步 SMDP 片段、raw/guarded/executed 动作、安全投影、
+终端 SOC 和四阶段训练属于本项目的多时间尺度安全控制扩展。
 
-    & 'D:\\anaconda\\anaconda\\envs\\python_3_8\\python.exe' hierarchical_td3_electric_gas_optimized.py
+本注释版只增加中文说明和 docstring，不改变任何默认参数、公式、维度或控制流。
 """
 
 from __future__ import annotations
@@ -100,16 +106,29 @@ LEGACY_ALGORITHM_API_VERSION = 5
 # =============================================================================
 # Configuration
 # =============================================================================
+#
+# 【模块说明：配置】输入是实验与算法超参数，输出是统一的 TrainConfig。
+# 它决定时间尺度、网络宽度、学习率、Replay 门槛、探索、奖励和 checkpoint 契约。
+# 初学者先区分 gamma_fast 与由指数换算出的 gamma_slow/gamma_manager。
+#
 
 
 # 【中文导读】集中保存三层时间尺度、TD3、奖励塑形、探索、日志和阶段训练参数；gamma_slow/gamma_manager由快速步折扣指数换算。
 @dataclass
 class TrainConfig:
-    """训练超参数集合。
-
-    强化学习代码通常把“算法参数”和“实验开关”都放在一个配置类里。
-    这里的参数可以粗分为：时间尺度、网络大小、TD3 学习参数、探索噪声、
-    奖励塑形、日志/评估/checkpoint。理解这些分组，比逐个背默认值更重要。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：集中保存三层 SMDP-TD3 的全部训练契约。
+    
+    输入：构造时传入可覆盖的超参数。
+    
+    输出：不可变维度/训练设置的配置对象。
+    
+    核心步骤：校验时间尺度、学习率、Replay、探索、奖励、评估和恢复参数。
+    
+    强化学习含义：配置决定采样量是否足够产生梯度更新。
+    
+    【容易混淆】gamma_slow/manager 是 gamma_fast 的指数结果，不是片段奖励的第二次折扣。
     """
 
     # 实验基础设置：随机种子、训练轮数、每轮步数和运行设备。
@@ -223,6 +242,11 @@ class TrainConfig:
 # =============================================================================
 # Utilities
 # =============================================================================
+#
+# 【模块说明：通用工具】提供随机数状态、设备选择、张量转换、目标网络更新、
+# goal 归一化和观测归一化。soft_update 是 TD3 稳定训练的核心工具；RNG 保存则保证
+# strict resume 后采样与探索能够确定性延续。
+#
 
 
 # 【中文导读】统一固定 Python、NumPy 和 PyTorch 随机源，便于复现实验。
@@ -316,7 +340,22 @@ def to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
 
 # 【中文导读】将三段方向 goal 分别单位化，并将物理参考压到 [-1,1]。
 def normalize_goal_tensor(goal: torch.Tensor) -> torch.Tensor:
-    """Manager goal = three L2-normalized directions plus tanh physical references."""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：把 goal 的各方向块归一化。
+    
+    输入：goal:[B,32]。
+    
+    输出：块结构保持不变的归一化 goal。
+    
+    核心步骤：分别处理共享/Slow/Fast 方向和物理目标。
+    
+    强化学习含义：限制高层动作尺度并保持方向语义。
+    
+    【容易混淆】这是 raw goal 的确定性变换，不是探索噪声。
+    
+    【张量形状】goal:[B,32]
+    """
     shared = F.normalize(goal[..., 0:8], p=2, dim=-1, eps=1e-8)
     slow = F.normalize(goal[..., 8:16], p=2, dim=-1, eps=1e-8)
     fast = F.normalize(goal[..., 16:24], p=2, dim=-1, eps=1e-8)
@@ -360,7 +399,22 @@ def execute_manager_goal_np(raw_goal: np.ndarray, previous_executed_goal: np.nda
 
 def execute_manager_goal_tensor(raw_goal: torch.Tensor, previous_executed_goal: torch.Tensor,
                                 smoothing: float) -> torch.Tensor:
-    """Differentiable counterpart used by Manager Actor and target Actor updates."""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：执行与交互阶段一致的可微 goal 平滑变换。
+    
+    输入：raw_goal、previous_executed_goal、smoothing。
+    
+    输出：executed_goal。
+    
+    核心步骤：先归一化，再与上一 executed goal 平滑，最后保持合法范围。
+    
+    强化学习含义：Actor 更新和 target 更新通过同一变换保持动作语义一致。
+    
+    【容易混淆】Critic 学 executed goal，而非未执行的 raw goal。
+    
+    【张量形状】输入/输出:[B,32]
+    """
 
     def canonical(value: torch.Tensor) -> torch.Tensor:
         return torch.cat([
@@ -388,6 +442,22 @@ def worker_goal_np(goal: np.ndarray, role: str) -> np.ndarray:
 
 # 【中文导读】批量张量版本的 Worker goal 切片。
 def worker_goal_tensor(goal: torch.Tensor, role: str) -> torch.Tensor:
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：从 32 维 Manager goal 选择某 Worker 的 24 维子 goal。
+    
+    输入：goal 与 role。
+    
+    输出：shared 8 + role direction 8 + physical 8。
+    
+    核心步骤：Slow/Fast 选择各自方向块并共享物理块。
+    
+    强化学习含义：让两层共享全局意图又保留角色分工。
+    
+    【容易混淆】Fast/Slow 输出维度相同但中间 8 维来源不同。
+    
+    【张量形状】[B,32] -> [B,24]
+    """
     if role == "slow":
         return torch.cat([goal[..., 0:8], goal[..., 8:16], goal[..., 24:32]], dim=-1)
     if role == "fast":
@@ -423,7 +493,20 @@ def expanded_goal_direction_tensor(goal: torch.Tensor, role: str, latent_dim: in
 
 # 【中文导读】在线维护观测均值和方差；训练时更新，评估时冻结。
 class RunningMeanStd:
-    """在线观测归一化器；评估时可冻结统计量。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：在线估计 observation 均值和方差。
+    
+    输入：一批 observation。
+    
+    输出：可归一化新 observation 的统计状态。
+    
+    核心步骤：用稳定的并行方差公式更新 count/mean/var。
+    
+    强化学习含义：归一化可减小不同物理量量纲对网络优化的影响。
+    
+    【容易混淆】评估和冻结阶段不能继续更新统计，否则策略输入分布会漂移。
+    """
 
     def __init__(self, shape: Tuple[int, ...], epsilon: float = 1e-4):
         self.mean = np.zeros(shape, dtype=np.float64)
@@ -522,11 +605,29 @@ class EpisodeCSVLogger:
 # =============================================================================
 # Observation builder
 # =============================================================================
+#
+# 【模块说明：观测构造】把环境全局状态转换为三层各自的 observation。
+# Manager 看全局和上一 executed goal；Slow 看紧凑电—气安全摘要；Fast 看快速电压、
+# 线路和新能源信息。命名布局避免 observation 改动后仍使用魔法索引。
+#
 
 
 @dataclass(frozen=True)
 class SlowObservationLayout:
-    """Single source of truth for the compact Slow Worker safety observation."""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：集中定义 Slow observation 的字段、长度和切片。
+    
+    输入：字段布局以及环境安全特征字典。
+    
+    输出：49 维扁平 Slow observation。
+    
+    核心步骤：按 fields 顺序验证长度、有限性并拼接。
+    
+    强化学习含义：慢层同时看到 SOC、电侧安全、气侧安全、预测、时间和 held action。
+    
+    【容易混淆】held_slow_action 是 10 维 RL 动作，不包含固定压缩机。
+    """
 
     fields: Tuple[Tuple[str, int], ...] = (
         ("soc", len(ESS_CONFIGS)),
@@ -582,7 +683,20 @@ SLOW_OBSERVATION_LAYOUT = SlowObservationLayout()
 
 # 【中文导读】从环境全局状态构造 Manager、快 Worker、慢 Worker 的任务相关观测。
 class ObservationBuilder:
-    """从环境读取多层状态，并补充训练所需的少量上下文。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：从 165 维全局状态构造三层 observation。
+    
+    输入：环境对象、Manager 间隔、全局状态和 previous goal。
+    
+    输出：Manager 197、Slow 49、Fast 115 维 observation。
+    
+    核心步骤：按各层控制职责抽取信息并追加时间/历史动作。
+    
+    强化学习含义：分层策略不必共享完全相同的 observation。
+    
+    【容易混淆】state 是环境真实状态概念，observation 是提供给某层网络的向量。
+    """
 
     def __init__(self, env: ElectricGasMultiScaleEnv, manager_interval: int):
         self.env = env
@@ -633,16 +747,30 @@ class ObservationBuilder:
 # =============================================================================
 # Replay buffers
 # =============================================================================
+#
+# 【模块说明：经验回放】分别保存 Fast 单步、Slow 多步和 Manager 多步 transition。
+# Replay 让 TD3 成为 off-policy 算法；duration_steps、done、raw/executed 动作决定 TD target
+# 和安全信用是否正确。优化版会在这些基础结构上增加 PER 与投影诊断字段。
+#
 
 
 # 【中文导读】保存每个 3 分钟步的状态、raw/executed 动作、分项奖励、goal 与终止标志。
 class FastReplayBuffer:
-    """快 Worker 的经验池。
-
-    一条样本对应一个 3 分钟快速步。这里同时保存 raw_action 和
-    executed_action：raw_action 是 Actor 请求动作，也是 Worker Critic 的动作
-    输入；executed_action 是环境安全投影后的真实动作，用于描述真实
-    状态转移、投影惩罚、投影模仿和诊断，不作为当前 Critic 输入。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：保存 Fast Worker 的单步 transition。
+    
+    输入：obs/next_obs、raw/executed action、奖励、goal、done。
+    
+    输出：供 Critic/Actor 采样的 tensor batch。
+    
+    核心步骤：环形写入并随机采样。
+    
+    强化学习含义：Fast transition 的 duration 固定为 1。
+    
+    【容易混淆】raw action 是 Critic 动作语义，executed action 描述真实转移。
+    
+    【张量形状】obs:[B,fast_obs_dim]；action:[B,16]；reward/done/duration:[B,1]
     """
 
     def __init__(self, capacity: int, obs_dim: int, action_dim: int, goal_dim: int, device: torch.device):
@@ -723,10 +851,21 @@ class FastReplayBuffer:
 
 # 【中文导读】保存跨多个快速步的慢时间尺度 SMDP 片段及 duration_steps。
 class SlowReplayBuffer:
-    """慢 Worker 的经验池。
-
-    慢动作每 20 个快速步才更新一次，所以一条慢样本不是单步 transition，
-    而是一个“片段”：obs_start -> obs_end，并累积片段内折扣奖励。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：保存 Slow Worker 的多步 SMDP transition。
+    
+    输入：片段起止 observation、动作统计、片段奖励、duration。
+    
+    输出：Slow TD3 batch。
+    
+    核心步骤：一个样本概括通常 20 个快速步，尾段使用真实长度。
+    
+    强化学习含义：Slow 的一步是持续时间不固定的宏动作。
+    
+    【容易混淆】不能只保存区间第一步 executed action。
+    
+    【张量形状】obs:[B,49]；action:[B,10]；duration:[B,1]
     """
 
     def __init__(self, capacity: int, obs_dim: int, action_dim: int, goal_dim: int, device: torch.device):
@@ -795,10 +934,21 @@ class SlowReplayBuffer:
 
 # 【中文导读】保存一个 Manager goal 持续区间的全局起止状态和折扣外在回报。
 class ManagerReplayBuffer:
-    """Manager 的经验池。
-
-    Manager 的动作是 32 维 goal。它不直接控制电网/气网，而是学习“给 Worker
-    什么方向目标，能让未来一段时间的总回报更好”。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：保存 Manager goal 片段。
+    
+    输入：当前/下一 Manager observation、raw/executed/previous goal、片段奖励与 duration。
+    
+    输出：Manager TD3 batch。
+    
+    核心步骤：每 40 个快速步或尾部结束时入库。
+    
+    强化学习含义：Manager 是 SMDP 高层策略。
+    
+    【容易混淆】goal smoothing 依赖 previous executed goal，因此它必须属于 Markov observation/Replay。
+    
+    【张量形状】obs:[B,197]；goal:[B,32]；reward/done/duration:[B,1]
     """
 
     def __init__(self, capacity: int, obs_dim: int, goal_dim: int, device: torch.device):
@@ -984,6 +1134,11 @@ def _load_replay_state_dict(buffer: Any, state: Mapping[str, Any], array_names: 
 # =============================================================================
 # Networks
 # =============================================================================
+#
+# 【模块说明：神经网络】Encoder 把 observation 压缩为 latent state；Actor 产生 goal
+# 或动作；双 Critic 分别估计 Q。两个 Critic 取较小值可降低过估计，是 TD3 相比 DDPG
+# 最重要的稳定化设计之一。
+#
 
 
 # 【中文导读】构造 Actor/Critic/Encoder 共用的两层 MLP。
@@ -1005,10 +1160,21 @@ def make_mlp(input_dim: int, output_dim: int, hidden_dim: int, layer_norm: bool 
 
 # 【中文导读】把高维物理观测编码为 latent state。
 class MLPEncoder(nn.Module):
-    """把原始观测压缩成 latent state。
-
-    TD3 本身不要求 Encoder，但这个环境观测维度较高，而且 Manager/Worker
-    需要在隐空间里比较“状态变化方向”，所以这里显式加了 Encoder。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：把 observation 编码为紧凑 latent state。
+    
+    输入：obs tensor。
+    
+    输出：latent tensor。
+    
+    核心步骤：多层感知机和非线性变换。
+    
+    强化学习含义：Actor/Critic 在归一化后的抽象状态上学习。
+    
+    【容易混淆】Encoder 不是环境状态转移模型。
+    
+    【张量形状】obs:[B,obs_dim] -> z:[B,latent_dim]
     """
 
     def __init__(self, obs_dim: int, latent_dim: int, hidden_dim: int):
@@ -1021,7 +1187,22 @@ class MLPEncoder(nn.Module):
 
 # 【中文导读】根据 Manager latent state 生成 32 维组合式 goal。
 class ManagerActor(nn.Module):
-    """Manager Actor：输入 latent state，输出 32 维 goal。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：根据 Manager latent state 输出 raw goal。
+    
+    输入：z。
+    
+    输出：32 维 raw goal。
+    
+    核心步骤：MLP 输出后再由统一 goal transform 归一化/平滑。
+    
+    强化学习含义：Actor 是确定性高层策略。
+    
+    【容易混淆】raw goal 不能绕过 execute_manager_goal_* 直接当 executed goal。
+    
+    【张量形状】z:[B,manager_latent_dim] -> raw_goal:[B,32]
+    """
 
     def __init__(self, latent_dim: int, goal_dim: int, hidden_dim: int):
         super().__init__()
@@ -1033,7 +1214,22 @@ class ManagerActor(nn.Module):
 
 # 【中文导读】双 Q 网络，估计全局 latent state 与 goal 的长期价值。
 class ManagerCritic(nn.Module):
-    """Manager Critic：估计在当前 latent state 下给出某个 goal 的价值。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：双 Q 网络评价 executed Manager goal。
+    
+    输入：z 与 32 维 goal。
+    
+    输出：Q1、Q2 标量。
+    
+    核心步骤：两个独立 MLP 并行估值。
+    
+    强化学习含义：取 min(Q1,Q2) 降低过估计。
+    
+    【容易混淆】优化版 Critic 动作语义是经过统一变换的 executed goal。
+    
+    【张量形状】z:[B,L]；goal:[B,32]；Q1/Q2:[B,1]
+    """
 
     def __init__(self, latent_dim: int, goal_dim: int, hidden_dim: int):
         super().__init__()
@@ -1051,7 +1247,22 @@ class ManagerCritic(nn.Module):
 
 # 【中文导读】根据 Worker latent state 和 24 维局部 goal 输出归一化控制动作。
 class WorkerActor(nn.Module):
-    """Worker Actor：输入自己的 latent state 和 Manager goal，输出归一化动作。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：根据 Worker latent state 和子 goal 输出 raw action。
+    
+    输入：z 与 24 维 Worker goal。
+    
+    输出：归一化动作请求。
+    
+    核心步骤：拼接状态和 goal 后由 MLP 输出 [-1,1] 动作。
+    
+    强化学习含义：Worker Actor 学习满足 Manager 意图的设备控制。
+    
+    【容易混淆】输出还要经过 guard 和环境安全投影。
+    
+    【张量形状】slow action:[B,10]；fast action:[B,16]
+    """
 
     def __init__(self, latent_dim: int, worker_goal_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
@@ -1063,7 +1274,22 @@ class WorkerActor(nn.Module):
 
 # 【中文导读】双 Q 网络，估计状态、goal 与 Actor raw request 动作的价值。
 class WorkerCritic(nn.Module):
-    """Worker Critic：估计状态、goal 与 raw request action 的 Q 值。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：双 Q 网络评价 raw request action。
+    
+    输入：z、Worker goal、raw action。
+    
+    输出：Q1、Q2。
+    
+    核心步骤：对相同输入用两个独立网络估值。
+    
+    强化学习含义：Critic 学习 Q(s,raw_request_action)，与 Actor 的输出空间一致。
+    
+    【容易混淆】executed action 用于真实转移/模仿，不应偷偷替换 Critic 动作。
+    
+    【张量形状】Q1/Q2:[B,1]
+    """
 
     def __init__(self, latent_dim: int, worker_goal_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
@@ -1096,14 +1322,28 @@ class TransitionModel(nn.Module):
 # =============================================================================
 # TD3 agents
 # =============================================================================
+#
+# 【模块说明：TD3 智能体】ManagerTD3 学习高层 goal，WorkerTD3 学习设备动作。
+# update 同时完成 Critic TD 回归、延迟 Actor 更新、target policy smoothing 和 target 网络
+# 软更新。初学者应重点跟踪 online/target 网络与 Actor/Critic 的不同更新频率。
+#
 
 
 # 【中文导读】高层 TD3；动作是 goal，样本是约两小时的聚合片段。
 class ManagerTD3:
-    """Manager 层 TD3。
-
-    与普通 TD3 的差别：Actor 的“动作”不是环境动作，而是给 Worker 的 goal；
-    Critic 学的是一个 Manager 时间段内累计出来的回报。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：封装 Manager 的 Actor、双 Critic、target 网络和优化器。
+    
+    输入：Manager observation、previous goal、Replay batch。
+    
+    输出：raw/executed goal或更新日志。
+    
+    核心步骤：选 goal 时统一变换；更新时构造 SMDP target、回归 Critic、延迟更新 Actor并软更新 target。
+    
+    强化学习含义：每 40 个快速步做一次高层决策。
+    
+    【容易混淆】Actor/target Actor 必须调用相同 goal transform。
     """
 
     # 【中文导读】创建在线/目标 Encoder、Actor、双 Critic，并完成硬同步和优化器初始化。
@@ -1169,6 +1409,7 @@ class ManagerTD3:
                 next_raw_goal + noise.clamp(-self.cfg.target_noise_clip, self.cfg.target_noise_clip)
             )
             next_goal = execute_manager_goal_tensor(next_raw_goal, goals, self.cfg.goal_smoothing)
+            # 【TD3关键】两个目标 Critic 独立估值；后续取较小值，抑制函数逼近造成的 Q 过高估计。
             q1_next, q2_next = self.target_critic(next_z, next_goal)
             q_next = torch.minimum(q1_next, q2_next)
             target_q = rewards + (1.0 - dones) * torch.pow(
@@ -1203,6 +1444,7 @@ class ManagerTD3:
                 goals_pi = execute_manager_goal_tensor(
                     raw_goals_pi, previous_goals, self.cfg.goal_smoothing
                 )
+                # 【TD3关键】Actor 通过最大化 Critic 评价来改进确定性策略；负号把最大化 Q 转为最小化 loss。
                 actor_loss = -self.critic.q_min(z_pi, goals_pi).mean()
                 actor_loss.backward()
             finally:
@@ -1210,6 +1452,7 @@ class ManagerTD3:
             clip_grad(self.actor.parameters(), self.cfg.gradient_clip)
             self.actor_optim.step()
             actor_loss_value = float(actor_loss.detach().cpu())
+            # 【TD3关键】target 网络缓慢追踪 online 网络，避免 bootstrap 目标随每次梯度更新剧烈移动。
             soft_update(self.target_actor, self.actor, self.cfg.tau)
             soft_update(self.target_critic, self.critic, self.cfg.tau)
             soft_update(self.target_encoder, self.encoder, self.cfg.tau)
@@ -1257,10 +1500,19 @@ class ManagerTD3:
 
 # 【中文导读】Slow/Fast 共用 TD3；Critic 使用 raw request，Actor 生成归一化请求动作。
 class WorkerTD3:
-    """快/慢 Worker 共用的 TD3 实现。
-
-    role="fast" 时动作是新能源逆变器的无功和削减；role="slow" 时动作是
-    ESS、GFG、P2G、压缩机设定。二者网络结构相同，观测维度、动作维度和折扣因子不同。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：封装 Fast/Slow Worker 的 TD3 学习。
+    
+    输入：Worker observation、Manager goal、Replay。
+    
+    输出：raw action或损失/诊断。
+    
+    核心步骤：编码状态、计算 TD target、更新双 Critic，按 policy_frequency 延迟更新 Actor。
+    
+    强化学习含义：Fast 每步控制，Slow 每 20 步控制。
+    
+    【容易混淆】Slow/Fast goal 都是 24 维，但切片含义不同。
     """
 
     # 【中文导读】创建 Worker 在线/目标网络及可选隐空间动力学模型。
@@ -1350,6 +1602,7 @@ class WorkerTD3:
             noise = (torch.randn_like(next_actions) * self.cfg.target_noise).clamp(
                 -self.cfg.target_noise_clip, self.cfg.target_noise_clip)
             next_actions = (next_actions + noise).clamp(-1.0, 1.0)
+            # 【TD3关键】两个目标 Critic 独立估值；后续取较小值，抑制函数逼近造成的 Q 过高估计。
             q1_next, q2_next = self.target_critic(next_z, next_wg, next_actions)
             # 半马尔可夫 TD 目标。Fast 使用 gamma_fast；Slow 当前传入固定 gamma_slow。
             # 对提前结束的短片段，理论上更严谨的折扣应为 gamma_fast ** duration_steps。
@@ -1412,6 +1665,7 @@ class WorkerTD3:
             set_requires_grad(self.critic, False)
             try:
                 actions_pi = self.actor(z_pi, wg)
+                # 【TD3关键】Actor 通过最大化 Critic 评价来改进确定性策略；负号把最大化 Q 转为最小化 loss。
                 actor_loss = -self.critic.q_min(z_pi, wg, actions_pi).mean()
                 if self.cfg.worker_action_l2_weight > 0.0:
                     actor_loss = actor_loss + self.cfg.worker_action_l2_weight * actions_pi.pow(2).mean()
@@ -1432,6 +1686,7 @@ class WorkerTD3:
             clip_grad(self.actor.parameters(), self.cfg.gradient_clip)
             self.actor_optim.step()
             actor_loss_value = float(actor_loss.detach().cpu())
+            # 【TD3关键】target 网络缓慢追踪 online 网络，避免 bootstrap 目标随每次梯度更新剧烈移动。
             soft_update(self.target_actor, self.actor, self.cfg.tau)
             soft_update(self.target_critic, self.critic, self.cfg.tau)
             soft_update(self.target_encoder, self.encoder, self.cfg.tau)
@@ -1503,7 +1758,20 @@ class AgentBundle:
 
 # 【中文导读】按环境真实观测/动作维度构建三层智能体，并按阶段选择 Worker 学习率。
 def build_agents(env: ElectricGasMultiScaleEnv, cfg: TrainConfig, device: torch.device) -> AgentBundle:
-    """按环境维度创建 Manager、慢 Worker、快 Worker。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：按真实 observation/action 维度创建三层智能体。
+    
+    输入：环境、TrainConfig、device。
+    
+    输出：AgentBundle。
+    
+    核心步骤：reset 环境、构造三层 observation、实例化 Manager/Slow/Fast。
+    
+    强化学习含义：网络输入维度必须与环境契约同步。
+    
+    【容易混淆】checkpoint schema 不匹配时不能靠填零继续。
+    """
 
     obs, _ = env.reset(seed=cfg.seed)
     builder = ObservationBuilder(env, cfg.manager_interval)
@@ -1521,6 +1789,11 @@ def build_agents(env: ElectricGasMultiScaleEnv, cfg: TrainConfig, device: torch.
 # =============================================================================
 # Reward shaping
 # =============================================================================
+#
+# 【模块说明：安全奖励】把环境分量组合为全局安全、角色特定、latent 方向、
+# 物理目标进展、投影惩罚和动作正则。没有电价、气价或套利项。Slow Worker 虽控制慢设备，
+# 仍必须获得电—气全局安全信用。
+#
 
 
 GLOBAL_SAFETY_COMPONENTS = (
@@ -1827,6 +2100,10 @@ def warmup_actor_blend(count: int, warmup_count: int, blend_fraction: float) -> 
 # =============================================================================
 # Action helpers and stage control
 # =============================================================================
+#
+# 【模块说明：动作保护与阶段控制】规则动作和 ESS guard 只改变
+# 送给环境的请求，不改变 raw Actor 动作的定义。stage_flags 决定四阶段中谁训练、谁冻结。
+#
 
 
 # 【中文导读】把物理压缩比反映射到 [-1,1] 动作空间。
@@ -1942,6 +2219,11 @@ def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: n
 # =============================================================================
 # Checkpointing
 # =============================================================================
+#
+# 【模块说明：checkpoint 与安全评估】统一保存网络、优化器、Replay、normalizer、
+# RNG、计数器和最佳评价状态；is_feasible 先检查安全阈值，再允许比较回报。旧 observation
+# schema 与当前维度不一致时不能 strict resume。
+#
 
 
 # 【中文导读】保存三层在线/目标网络、优化器、归一化器与训练元数据。
@@ -1967,7 +2249,20 @@ def checkpoint_metadata(agents: AgentBundle) -> Dict[str, Any]:
 
 
 def is_feasible(metrics: Mapping[str, Any], cfg: TrainConfig) -> Tuple[bool, List[str]]:
-    """Evaluate every configured solver and hard-safety threshold in one place."""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：统一判断评估结果是否满足全部安全阈值。
+    
+    输入：metrics 与配置阈值。
+    
+    输出：可行布尔值及逐项失败原因。
+    
+    核心步骤：检查求解成功率、SOC/硬约束、电压/气压及其他配置阈值。
+    
+    强化学习含义：安全模型选择先比较可行性。
+    
+    【容易混淆】高 return 不能覆盖不可行约束。
+    """
 
     checks = (
         ("solver_failures", "<=", 0.0),
@@ -2125,6 +2420,20 @@ def save_checkpoint(path: Path, cfg: TrainConfig, agents: AgentBundle, episode: 
                     manager_replay: Optional[ManagerReplayBuffer] = None,
                     next_episode: Optional[int] = None,
                     checkpoint_kind: str = "full_resume") -> None:
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：保存策略或完整训练状态。
+    
+    输入：路径、配置、智能体、Replay、计数器、最佳评价等。
+    
+    输出：磁盘 checkpoint。
+    
+    核心步骤：序列化网络、target、优化器、normalizer、Replay、RNG 和 metadata。
+    
+    强化学习含义：full resume 要求训练轨迹可严格延续。
+    
+    【容易混淆】policy checkpoint 与 full resume checkpoint 的用途不同。
+    """
     if checkpoint_kind not in ("lightweight", "full_resume"):
         raise ValueError(f"checkpoint_kind={checkpoint_kind!r} must be lightweight or full_resume")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2267,6 +2576,20 @@ def load_checkpoint(path: str, agents: AgentBundle, map_location: torch.device,
                     fast_replay: Optional[FastReplayBuffer] = None,
                     slow_replay: Optional[SlowReplayBuffer] = None,
                     manager_replay: Optional[ManagerReplayBuffer] = None) -> Dict[str, Any]:
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：按 resume/stage_transfer/policy_only 语义加载 checkpoint。
+    
+    输入：路径、智能体、设备和加载模式。
+    
+    输出：恢复信息字典。
+    
+    核心步骤：先校验 schema/维度，再按模式恢复允许的状态。
+    
+    强化学习含义：三种模式对应继续训练、跨阶段迁移和仅策略评估。
+    
+    【容易混淆】缺 Replay/优化器/RNG 时不得静默 strict resume。
+    """
     load_mode = mode or ("policy_only" if policy_only else "resume")
     payload = trusted_torch_load(path, map_location=map_location)
     validate_checkpoint_compatibility(payload, agents, load_mode=load_mode)
@@ -2375,14 +2698,29 @@ def save_best_files(root: Path, agents: AgentBundle, cfg: TrainConfig, episode: 
 # =============================================================================
 # Training and evaluation
 # =============================================================================
+#
+# 【模块说明：多时间尺度主循环】全局状态依次经过 Manager goal、Worker
+# 动作、安全投影和环境求解；Fast 每步入库，Slow/Manager 到边界时聚合入库。这里是理解
+# SMDP、done/truncated、终端 SOC 和四阶段交互的核心。
+#
 
 
 # 【中文导读】暂存刚执行的快动作，等待下一快观测后计算内在奖励并入库。
 @dataclass
 class PendingFastTransition:
-    """尚未入库的快步样本。
-
-    之所以 pending，是因为执行动作后才能拿到 next_obs，并计算内在奖励。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：暂存尚缺 next observation 的 Fast transition。
+    
+    输入：当前 obs、raw/executed action、奖励、goal、done。
+    
+    输出：下一步到来后可写入 Fast Replay 的记录。
+    
+    核心步骤：延迟一个快速步补齐 next_obs 与 shaping。
+    
+    强化学习含义：保证 transition 的时间对齐。
+    
+    【容易混淆】pending 不等于 Replay；只有 finalize 后才真正插入。
     """
 
     obs: np.ndarray
@@ -2401,9 +2739,19 @@ class PendingFastTransition:
 # 【中文导读】累计一个慢动作保持区间内的折扣奖励、投影惩罚和持续步数。
 @dataclass
 class PendingSlowSegment:
-    """慢动作片段缓存。
-
-    慢动作会保持多个快速步，所以先把片段奖励累加，等下一个慢动作时再入库。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：聚合一个 Slow 保持区间。
+    
+    输入：片段起点、raw slow action、goal。
+    
+    输出：包含折扣奖励、动作序列统计和真实 duration 的 Slow transition。
+    
+    核心步骤：逐快速步累积 reward/projection，边界或 episode 结束时 finalize。
+    
+    强化学习含义：Slow 宏动作通常持续 20 步。
+    
+    【容易混淆】episode 尾部可能不足 20 步，不能伪造 duration。
     """
 
     obs_start: np.ndarray
@@ -2422,7 +2770,20 @@ class PendingSlowSegment:
 # 【中文导读】累计一个 Manager goal 区间内的环境回报和持续步数。
 @dataclass
 class PendingManagerSegment:
-    """Manager 片段缓存，记录一个 goal 持续期间累计到的环境回报。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：聚合一个 Manager goal 区间。
+    
+    输入：Manager 起始 observation、raw/executed/previous goal。
+    
+    输出：通常持续 40 步的 Manager transition。
+    
+    核心步骤：逐步折扣累积全局安全奖励和约束统计。
+    
+    强化学习含义：高层动作的回报跨越多个底层控制步。
+    
+    【容易混淆】时间截断默认 done，因 reset 会切换外生场景，不能跨场景 bootstrap。
+    """
 
     obs_start: np.ndarray
     goal: np.ndarray  # executed goal passed to both Workers
@@ -2487,12 +2848,19 @@ def finalize_slow_segment(pending: PendingSlowSegment, obs_end: np.ndarray, next
 
 # 【中文导读】三层时钟驱动的主训练循环，负责交互、聚合、更新、评估和保存。
 def run_training(cfg: TrainConfig) -> Dict[str, Any]:
-    """主训练循环。
-
-    这是全文件最重要的函数。读它时可以把循环想成三层时钟：
-    - 每 1 个快速步：快 Worker 选动作，环境前进一步；
-    - 每 20 个快速步：慢 Worker 重新给 ESS/GFG/P2G/压缩机设定；
-    - 每 40 个快速步：Manager 重新给两个 Worker 一个高层 goal。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：执行一个明确训练阶段的多时间尺度环境交互与更新。
+    
+    输入：TrainConfig。
+    
+    输出：运行目录、更新计数、最佳评价和参数变化等结果。
+    
+    核心步骤：reset→Manager goal→Slow/Fast action→安全投影→step→分层片段入库→按预算更新→评估/checkpoint。
+    
+    强化学习含义：这是三个时间尺度合流的核心。
+    
+    【容易混淆】环境 reward 用于评估；各层有效训练 reward 可有不同聚合。
     """
 
     set_seed(cfg.seed)
@@ -2770,6 +3138,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             # compressor(1); Fast 16 = inverter Q(8)+renewable curtailment(8); total 26.
             # 实际 RL 布局：[ESS(3), GFG(3), P2G(3), controlled compressor(1),
             # inverter-Q(8), renewable-curtailment(8)]，共 10+16=26 维。
+            # 【安全语义】环境动作严格为 Slow 10 维 + Fast 16 维；随后仍要经过环境物理安全投影。
             joint_action = np.concatenate([held_slow_action, fast_action]).astype(np.float32)
             next_global_obs, env_reward, terminated, truncated, info = safe_env_step(env, joint_action, global_obs)
             time_limit_truncated = bool(
@@ -2821,6 +3190,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 if info.get("slow_action_applied", False):
                     pending_slow.executed_action = applied[:env.slow_action_dim].copy()
                 # 片段内部按快速步折扣：R_seg = Σ gamma_fast^k * r_{t+k}。
+                # 【SMDP关键】片段内部按快速步折扣累计；TD bootstrap 只再乘 gamma_fast**duration，不能二次折扣。
                 pending_slow.discounted_reward += (cfg.gamma_fast ** pending_slow.duration_steps) * slow_external
                 pending_slow.discounted_global_safety_reward += (
                     cfg.gamma_fast ** pending_slow.duration_steps
@@ -2840,6 +3210,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 # Manager 直接看环境总奖励，学习 goal 对未来一段时间总回报的影响。
                 # Manager 聚合完整环境回报；goal change penalty 已在片段初始化时一次性加入。
                 manager_step_reward = manager_safety_reward_from_components(info, cfg)["reward"]
+                # 【SMDP关键】Manager 奖励跨 goal 保持区间累计，duration 记录真实快速步数。
                 pending_manager.discounted_reward += (
                     cfg.gamma_fast ** pending_manager.duration_steps
                 ) * float(manager_step_reward)
@@ -3255,10 +3626,19 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
 # 【中文导读】冻结观测统计并关闭探索噪声，评估回报和电气约束指标。
 def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, max_steps: int = EPISODE_STEPS,
                     seed: int = 12345) -> Dict[str, float]:
-    """无探索噪声评估策略。
-
-    评估时冻结 RunningMeanStd，避免把评估轨迹混入训练统计；动作也不加噪声。
-    返回的统计量既包括回报，也包括电压/气压稳定性，方便判断策略是否只是“奖励变好”。
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：在无探索噪声下评估当前策略。
+    
+    输入：三层智能体、配置、episode 数、步数和种子。
+    
+    输出：统一安全指标与 return。
+    
+    核心步骤：冻结 normalizer/网络模式，运行确定性控制并调用 is_feasible。
+    
+    强化学习含义：评估与最佳模型选择必须共享同一安全逻辑。
+    
+    【容易混淆】训练 return 改善不等于可行。
     """
 
     previous_modes = (
@@ -3333,6 +3713,7 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
                     )
                     held_slow_action, _ = apply_ess_action_guard(env, raw_slow_action, cfg, horizon_steps)
                 fast_action = agents.fast.select_action(fast_obs, current_goal, 0.0, deterministic=True)
+                # 【安全语义】环境动作严格为 Slow 10 维 + Fast 16 维；随后仍要经过环境物理安全投影。
                 joint_action = np.concatenate([held_slow_action, fast_action]).astype(np.float32)
                 global_obs, reward, terminated, truncated, info = safe_env_step(env, joint_action, global_obs)
                 if (t + 1 >= max_steps and not terminated and not truncated
@@ -3449,6 +3830,10 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
 # =============================================================================
 # Minimum tests
 # =============================================================================
+#
+# 【模块说明：基础测试】覆盖维度、SMDP、Replay、冻结参数、checkpoint 和短训练。
+# 测试用于证明代码契约，不代表正式训练已经达到安全可行。
+#
 
 
 # 【中文导读】最小测试中检查训练日志是否为有限数。
@@ -3691,6 +4076,10 @@ def run_minimum_tests() -> None:
 # =============================================================================
 # CLI
 # =============================================================================
+#
+# 【模块说明：命令行入口】把命令行参数映射为 TrainConfig。正式训练使用优化版入口；
+# 基础版只保留兼容和测试用途。
+#
 
 
 # 【中文导读】把命令行参数映射为 TrainConfig。
@@ -3821,7 +4210,20 @@ def parse_args() -> TrainConfig:
 
 # 【中文导读】顺序执行 fast、slow、manager、joint 四个训练阶段并传递 checkpoint。
 def run_all_stages(cfg: TrainConfig) -> Dict[str, Any]:
-    """按 fast -> slow -> manager -> joint 顺序训练，上一阶段checkpoint自动接到下一阶段。"""
+    """【初学者重点】下面按固定结构说明这段代码，建议先看功能和强化学习含义，再回到实现细节。
+    
+    功能：顺序执行四阶段训练。
+    
+    输入：总配置及各阶段 episode 数。
+    
+    输出：每阶段结果和最终 checkpoint。
+    
+    核心步骤：Fast→Slow→Manager→Joint，传递最佳网络与连续 exploration offset。
+    
+    强化学习含义：预训练降低联合学习的非平稳性。
+    
+    【容易混淆】stage_transfer 不恢复上一阶段 Replay/优化器。
+    """
     stages = ["fast_pretrain", "slow_pretrain", "manager_train", "joint_finetune"]#分组
     total = max(int(cfg.episodes), 1)#总训练轮数
     base = total // len(stages)#每个阶段基础训练轮数

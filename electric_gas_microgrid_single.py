@@ -49,7 +49,8 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 # =============================================================================
 
 
-ENV_MODEL_VERSION = "belgian20_derived_mp_v2"
+ENV_MODEL_VERSION = "belgian20_derived_mp_v3"
+SLOW_SAFETY_SCHEMA_VERSION = 2
 GAS_MODEL_NAME = "Belgian-20-derived medium-pressure micro gas distribution network"
 
 
@@ -534,7 +535,7 @@ def calibration_warning_messages() -> Tuple[str, ...]:
         f"{GAS_MODEL_NAME} ({ENV_MODEL_VERSION}).",
         "Node names are Belgian-20 topology-source labels only; pipe length, diameter, pressure, load, source and compressor data are medium-pressure research calibrations.",
         "The 7->8 station is a fixed-ratio hydraulic compressor with equivalent_units=2; flow and power values already represent the aggregated station.",
-        "Only COMP_17_TO_18 is exposed to the RL slow action in belgian20_derived_mp_v2.",
+        f"Only COMP_17_TO_18 is exposed to the RL slow action in {ENV_MODEL_VERSION}.",
         "P2G includes gas conditioning and injection boosting in the aggregate efficiency; no extra P2G compressors are modeled.",
         "Supplier marginal costs, pipe roughness, gas composition and all device ratings remain research assumptions unless project data are supplied.",
     )
@@ -1670,6 +1671,7 @@ class Snapshot:
 
 # 【中文导读】Gymnasium 风格环境，完成动作映射、安全投影、求解、状态和奖励。
 class ElectricGasMultiScaleEnv:
+    slow_safety_schema_version = SLOW_SAFETY_SCHEMA_VERSION
     """Gymnasium 风格的电-气耦合环境。
 
     环境负责把智能体的 [-1, 1] 动作翻译成工程量，调用求解器推进 3 分钟，
@@ -1896,7 +1898,8 @@ class ElectricGasMultiScaleEnv:
             renewable_q_mvar=fast_projected["renewable_q_mvar"],
             renewable_curtailment=fast_projected["renewable_curtailment"],
         )
-        # executed_action 反映所有 SOC/容量约束后的真实动作，训练 Critic 时应使用这一版本。
+        # executed_action 反映所有 SOC/容量约束后的真实动作，用于真实
+        # 状态转移、投影惩罚、投影模仿与诊断；Worker Critic 使用 raw request。
         self.last_applied_action = self._normalized_action_from_physical(physical)
         return physical
 
@@ -1904,8 +1907,9 @@ class ElectricGasMultiScaleEnv:
     def _normalized_action_from_physical(self, physical: PhysicalActions) -> np.ndarray:
         """将安全投影后的物理动作反算回 Actor 使用的 [-1, 1] 归一化动作。
 
-        训练脚本会把 raw_action 和 applied_action 一起写入 replay buffer，
-        让 Critic 学“实际执行动作”的价值。
+        训练脚本会把 raw_action 和 applied_action 一起写入 Replay。当前 Worker
+        Critic 的动作输入是 raw request；这里返回的 executed action 用于描述真实
+        状态转移、投影惩罚、投影模仿和诊断。
         """
         values: List[float] = []
         values.extend([
@@ -1933,6 +1937,47 @@ class ElectricGasMultiScaleEnv:
             for i in range(self.n_renew)
         ])
         return np.asarray(values, dtype=float)
+
+    def _current_normalized_slow_action(self) -> np.ndarray:
+        """Return the held physical dispatch in the Slow Actor's exact [-1,1] coordinates."""
+
+        if self.profiles is None:
+            raise RuntimeError("Current normalized slow action requires reset()")
+        projections = list(self.last_inverter_projection)
+        physical = PhysicalActions(
+            ess_p_mw=np.asarray(self.last_physical_slow["ess_p_mw"], dtype=float).copy(),
+            gfg_p_mw=np.asarray(self.last_physical_slow["gfg_p_mw"], dtype=float).copy(),
+            p2g_p_mw=np.asarray(self.last_physical_slow["p2g_p_mw"], dtype=float).copy(),
+            compressor_ratio=np.asarray(
+                self.last_physical_slow["compressor_ratio"], dtype=float
+            ).copy(),
+            renewable_p_mw=np.asarray(
+                [item.p_actual_mw for item in projections] or np.zeros(self.n_renew), dtype=float
+            ),
+            renewable_q_mvar=np.asarray(
+                [item.q_actual_mvar for item in projections] or np.zeros(self.n_renew), dtype=float
+            ),
+            renewable_curtailment=np.asarray(
+                [item.curtailment for item in projections] or np.zeros(self.n_renew), dtype=float
+            ),
+        )
+        slow_action = np.asarray(
+            self._normalized_action_from_physical(physical)[:self.slow_action_dim],
+            dtype=np.float32,
+        )
+        if slow_action.shape != (self.slow_action_dim,):
+            raise AssertionError(
+                f"current normalized slow action shape={slow_action.shape}, "
+                f"expected={(self.slow_action_dim,)}"
+            )
+        if not np.all(np.isfinite(slow_action)):
+            raise RuntimeError("Current normalized slow action contains NaN/Inf")
+        if np.any(slow_action < -1.0 - 1e-6) or np.any(slow_action > 1.0 + 1e-6):
+            raise AssertionError(
+                f"Current normalized slow action is outside [-1,1]: "
+                f"min={slow_action.min()}, max={slow_action.max()}"
+            )
+        return slow_action
 
     # 【中文导读】将 8 个无功请求和 8 个弃电请求投影到逆变器能力圆。
     def _project_fast_actions(self, fast: np.ndarray, profile: Dict[str, np.ndarray | float]) -> Dict[str, np.ndarray]:
@@ -2061,6 +2106,10 @@ class ElectricGasMultiScaleEnv:
         )
         total_base_load_mw = float(sum(item[1] for item in IEEE33_LOAD_DATA))
         load_scale = max(total_base_load_mw, 1e-6)
+        total_load_mw = total_base_load_mw * float(current["load_multiplier"])
+        power_loss_mw = float(np.nansum(self._series_values(
+            self.power.net, "res_line", "pl_mw", len(IEEE33_LINE_DATA), 0.0
+        )))
         available_total = float(np.sum(renewable_available))
         actual_total = float(np.sum(renewable_actual))
         curtailment_rate = max(available_total - actual_total, 0.0) / max(available_total, 1e-6)
@@ -2086,16 +2135,9 @@ class ElectricGasMultiScaleEnv:
         overload = np.maximum(loading - self.config.power.max_line_loading_percent, 0.0)
         hour = (t * self.config.time.dt_hours) % 24.0
         day_fraction = (t % self.config.time.steps_per_day) / self.config.time.steps_per_day
-        held_action = np.concatenate([
-            np.asarray(self.last_physical_slow["ess_p_mw"], dtype=float)
-            / np.maximum(np.asarray([item.max_p_mw for item in ESS_CONFIGS], dtype=float), 1e-9),
-            np.asarray(self.last_physical_slow["gfg_p_mw"], dtype=float)
-            / np.maximum(np.asarray([item.max_p_mw for item in GFG_CONFIGS], dtype=float), 1e-9),
-            np.asarray(self.last_physical_slow["p2g_p_mw"], dtype=float)
-            / np.maximum(np.asarray([item.max_p_mw for item in P2G_CONFIGS], dtype=float), 1e-9),
-            np.asarray(self.last_physical_slow["compressor_ratio"], dtype=float)
-            / np.maximum(np.asarray([item.max_pressure_ratio for item in COMPRESSOR_CONFIGS], dtype=float), 1e-9),
-        ])
+        # One inverse mapping implementation only: held state and Replay executed
+        # actions use the same coordinates as the Slow Actor request.
+        held_action = self._current_normalized_slow_action()
         features = {
             "soc": self.ess_soc.copy(),
             "soc_low_margin": soc_low_margin,
@@ -2110,12 +2152,15 @@ class ElectricGasMultiScaleEnv:
                 np.count_nonzero(overload > 0.0) / max(float(loading.size), 1.0),
             ]),
             "power_balance": np.asarray([
+                total_load_mw / load_scale,
                 float(ext_p[0]) / load_scale,
-                float(current["load_multiplier"]),
                 available_total / load_scale,
                 actual_total / load_scale,
                 curtailment_rate,
             ]),
+            # Per-unit on the installed IEEE-33 active-load base.  Keeping loss
+            # separate avoids silently treating load multiplier as real MW.
+            "power_loss": np.asarray([power_loss_mw / load_scale]),
             "power_forecast": np.asarray([
                 float(current["load_multiplier"]),
                 float(next_slow["load_multiplier"]),
@@ -2142,11 +2187,19 @@ class ElectricGasMultiScaleEnv:
             ]),
             "held_slow_action": held_action,
         }
-        return {
-            key: np.nan_to_num(np.asarray(value, dtype=np.float32).reshape(-1),
-                               nan=0.0, posinf=10.0, neginf=-10.0)
+        if features["held_slow_action"].size != self.slow_action_dim:
+            raise AssertionError(
+                "held_slow_action must contain only RL-controlled slow devices: "
+                f"actual={features['held_slow_action'].size}, expected={self.slow_action_dim}"
+            )
+        output = {
+            key: np.asarray(value, dtype=np.float32).reshape(-1)
             for key, value in features.items()
         }
+        nonfinite = [key for key, value in output.items() if not np.all(np.isfinite(value))]
+        if nonfinite:
+            raise RuntimeError(f"Non-finite slow safety feature(s): {nonfinite}")
+        return output
 
     # 【中文导读】计算加权成本、物理诊断指标，并返回成本和的负值。
     def _compute_reward(self, solver_failed: bool) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
@@ -2569,7 +2622,9 @@ def run_fixed_compressor_station_consistency_test(config: ProjectConfig | None =
 def run_controllable_compressor_ratio_sensitivity_test(config: ProjectConfig | None = None) -> Dict[str, Any]:
     cfg = config or DEFAULT_CONFIG
     if CONTROLLED_COMPRESSOR_INDICES != (1,):
-        raise AssertionError("Only COMP_17_TO_18 should be controllable in belgian20_derived_mp_v2")
+        raise AssertionError(
+            f"Only COMP_17_TO_18 should be controllable in {ENV_MODEL_VERSION}"
+        )
     fixed = compressor_engineering_ratio(COMPRESSOR_CONFIGS[0])
     comp = COMPRESSOR_CONFIGS[1]
     scenario_candidates = (
