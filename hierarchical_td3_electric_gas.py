@@ -174,14 +174,21 @@ class TrainConfig:
     alpha_external: float = 1.0
     # beta_* are relative shaping fractions after calibration against |external reward|.
     beta_latent: float = 0.05
-    beta_physical: float = 0.10
+    beta_physical: float = 0.20
     shaping_reference_floor: float = 1.0
-    lambda_projection: float = 5.0
+    lambda_projection: float = 1.0
     worker_reward_clip_abs: float = 1_000.0
     manager_reward_clip_abs: float = 2_000.0
-    worker_action_l2_weight: float = 0.02
+    # This coefficient regularizes distance to a role-specific physical reference,
+    # not distance to normalized zero (zero means 25% curtailment for renewables).
+    worker_action_l2_weight: float = 0.002
     reward_component_transform: str = "log1p_reference"
-    reward_scale_profile: str = "safety_calibrated_20260714_v1"
+    reward_scale_profile: str = "safety_calibrated_20260716_v2"
+    # Fixed from the 2026-07-15 Replay diagnosis: with nominal 0.5/0.5
+    # weights Slow role credit contributed only 0.96% of the absolute reward.
+    # A fixed multiplier preserves stationarity and targets roughly a 80/20
+    # global/role split without weakening the mandatory global safety signal.
+    slow_role_specific_reward_scale: float = 25.0
     # This cap is applied after reference normalization, never to raw physical cost.
     worker_component_clip_abs: float = 50.0
     projection_imitation_weight: float = 0.0
@@ -507,6 +514,13 @@ class EpisodeCSVLogger:
             "nonfinite_batch_count", "fast_normalizer_count", "slow_normalizer_count",
             "manager_normalizer_count", "mean_target_q_clipping_ratio",
             "mean_reward_clipping_ratio", "mean_actor_action_saturation_ratio",
+            "fast_actor_action_abs_mean", "slow_actor_action_abs_mean",
+            "fast_actor_action_saturation_ratio", "slow_actor_action_saturation_ratio",
+            "fast_actor_reference_deviation_rms", "slow_actor_reference_deviation_rms",
+            "fast_curtailment_action_mean",
+            "slow_raw_to_guard_projection_rms", "slow_guard_to_executed_projection_rms",
+            "slow_global_safety_group_share", "slow_role_specific_group_share",
+            "joint_evaluations_without_improvement", "early_stop_requested",
         ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", newline="", encoding="utf-8") as f:
@@ -893,7 +907,7 @@ def _replay_state_dict(buffer: Any, array_names: Sequence[str]) -> Dict[str, Any
     goal_array = getattr(buffer, "goals", getattr(buffer, "manager_goals", None))
     goal_dim = int(goal_array.shape[1]) if goal_array is not None else 0
     state: Dict[str, Any] = {
-        "replay_schema_version": 4,
+        "replay_schema_version": 5,
         "replay_type": type(buffer).__name__,
         "capacity": int(buffer.capacity),
         "valid_size": valid_size,
@@ -918,7 +932,7 @@ def _load_replay_state_dict(buffer: Any, state: Mapping[str, Any], array_names: 
             f"Replay capacity mismatch: checkpoint={saved_capacity}, current={buffer.capacity}"
         )
     schema = int(state.get("replay_schema_version", 1))
-    if schema not in (1, 2, 3, 4):
+    if schema not in (1, 2, 3, 4, 5):
         raise ValueError(f"Unsupported replay_schema_version={schema}")
     if schema >= 2:
         expected_type = type(buffer).__name__
@@ -1634,10 +1648,14 @@ def worker_safety_reward_from_components(info: Dict[str, Any], role: str,
     role_raw, role_used, role_clips = group(role_keys)
     global_weight = float(getattr(cfg, f"{role}_global_safety_weight", 0.0))
     role_weight = float(getattr(cfg, f"{role}_role_specific_weight", 1.0))
+    role_scale = (
+        float(getattr(cfg, "slow_role_specific_reward_scale", 1.0))
+        if role == "slow" else 1.0
+    )
     global_weighted = global_weight * global_used
-    role_weighted = role_weight * role_used
+    role_weighted = role_weight * role_scale * role_used
     total = global_weighted + role_weighted
-    raw_total = global_weight * global_raw + role_weight * role_raw
+    raw_total = global_weight * global_raw + role_weight * role_scale * role_raw
     return {
         "global_raw": global_raw,
         "global_used": global_used,
@@ -1645,6 +1663,7 @@ def worker_safety_reward_from_components(info: Dict[str, Any], role: str,
         "role_raw": role_raw,
         "role_used": role_used,
         "role_weighted": role_weighted,
+        "role_scale": role_scale,
         "total": total,
         "raw_total": raw_total,
         "component_clipped": float(global_clips + role_clips > 0),
@@ -2116,6 +2135,19 @@ def is_better_evaluation(stats: Mapping[str, Any], best_metric_state: Optional[M
     return compare_evaluation_metric(current, best_metric_state, tolerance) > 0
 
 
+def should_early_stop_joint(cfg: TrainConfig, completed_episodes: int,
+                            evaluations_without_improvement: int) -> bool:
+    """Apply patience only after enough complete-day joint fine-tuning episodes."""
+
+    return bool(
+        cfg.training_stage == "joint_finetune"
+        and int(completed_episodes) >= int(getattr(cfg, "joint_early_stop_min_episodes", 0))
+        and int(evaluations_without_improvement) >= int(getattr(
+            cfg, "joint_early_stop_patience_evaluations", 3
+        ))
+    )
+
+
 def save_checkpoint(path: Path, cfg: TrainConfig, agents: AgentBundle, episode: int,
                     global_step: int, best_return: float,
                     best_metric_state: Optional[Mapping[str, Any]] = None,
@@ -2513,6 +2545,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     loaded_global_step = 0
     start_episode = 0
     strict_resume_restored = False
+    inherited_stage_best = False
     resume_missing_components: List[str] = []
     load_mode = getattr(cfg, "checkpoint_load_mode", "policy_only" if cfg.load_policy_only else "resume")
 
@@ -2543,8 +2576,17 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             LOGGER.info("Resumed complete training state at global_step=%s next_episode=%s.",
                         loaded_global_step, start_episode)
         elif load_mode == "stage_transfer":
+            if (cfg.training_stage == "joint_finetune"
+                    and bool(getattr(cfg, "inherit_stage_best_on_joint_transfer", False))):
+                loaded_best = payload.get("best_return", -float("inf"))
+                loaded_best_return = float(loaded_best) if loaded_best is not None else -float("inf")
+                loaded_best_metric_state = dict(payload.get("best_metric_state", {}))
+                loaded_best_evaluation_stats = dict(payload.get("best_evaluation_stats", {}))
+                inherited_stage_best = bool(loaded_best_metric_state)
             LOGGER.info("Stage transfer loaded network/normalizer weights and retained Critic weights; "
-                        "optimizers, update counts, Replay, RNG, scheduling and stage best are reset.")
+                        "optimizers, update counts, Replay, RNG and scheduling are reset%s.",
+                        "; the transferred safety candidate is retained for joint comparison"
+                        if inherited_stage_best else "; stage best is reset")
         elif load_mode == "policy_only":
             LOGGER.info("Loaded policy/normalizer only; critics, optimizers, targets, update counts, Replay, RNG and stage best are reset.")
 
@@ -2569,8 +2611,31 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     best_evaluation_stats = loaded_best_evaluation_stats
     global_step = loaded_global_step
     consecutive_solver_failure_episodes = 0
+    actor_collapse_episodes = {"fast": 0, "slow": 0}
+    actor_saturation_episodes = {"fast": 0, "slow": 0}
+    joint_evaluations_without_improvement = 0
+    early_stopped = False
+    completed_next_episode = start_episode
+
+    # Preserve the transferred Manager-stage candidate under the joint filename
+    # before any joint gradient step.  If joint learning only degrades safety,
+    # best_joint.pt therefore remains the actually transferred safer policy.
+    if inherited_stage_best:
+        save_best_files(
+            run_root, agents, cfg, -1, global_step, best_eval_return,
+            best_metric_state, best_evaluation_stats,
+            fast_buffer, slow_buffer, manager_buffer, 0,
+        )
 
     for episode in range(start_episode, cfg.episodes):
+        if cfg.training_stage == "joint_finetune":
+            freeze_episodes = int(getattr(cfg, "joint_freeze_manager_actor_episodes", 0))
+            manager_actor_enabled = episode >= freeze_episodes
+            set_requires_grad(agents.manager.actor, manager_actor_enabled)
+            agents.manager.actor.train(manager_actor_enabled)
+            writer.add_scalar(
+                "training_stage/manager_actor_trainable", float(manager_actor_enabled), episode
+            )
         # 4) 一个 episode 表示一天调度。每个快速步是 3 分钟，默认 480 步。
         global_obs, info = env.reset(seed=cfg.seed + episode)
         builder = ObservationBuilder(env, cfg.manager_interval)
@@ -2966,11 +3031,12 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         mean_voltage_rms = float(np.mean(voltage_rms_deviations)) if voltage_rms_deviations else 0.0
         mean_gas_pressure_rms = float(np.mean(gas_pressure_rms_deviations)) if gas_pressure_rms_deviations else 0.0
 
-        def mean_training_metric(suffix: str) -> float:
+        def mean_training_metric(suffix: str, role: Optional[str] = None) -> float:
             values = [
                 value
                 for name, items in episode_training_metrics.items()
                 if name.endswith(suffix)
+                and (role is None or name.startswith(f"training_batch/{role}/"))
                 for value in items
             ]
             return float(np.mean(values)) if values else 0.0
@@ -2987,7 +3053,36 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         mean_target_q_clipping = mean_training_metric("target_q_clipping_ratio")
         mean_reward_clipping = mean_training_metric("reward_clipping_ratio")
         mean_action_saturation = mean_training_metric("actor_action_saturation_ratio")
+        fast_actor_action_saturation = mean_training_metric(
+            "actor_action_saturation_ratio", "fast"
+        )
+        slow_actor_action_saturation = mean_training_metric(
+            "actor_action_saturation_ratio", "slow"
+        )
         mean_dynamic_projection_mse = mean_training_metric("dynamic_projection_mse")
+        slow_raw_to_guard_projection_mse = mean_training_metric(
+            "raw_to_guarded_projection_mse", "slow"
+        )
+        slow_guard_to_executed_projection_mse = mean_training_metric(
+            "guarded_to_executed_projection_mse", "slow"
+        )
+        slow_global_safety_group_share = mean_training_metric(
+            "global_safety_group_share", "slow"
+        )
+        slow_role_specific_group_share = mean_training_metric(
+            "role_specific_group_share", "slow"
+        )
+        fast_actor_action_abs_mean = mean_training_metric("actor_action_abs_mean", "fast")
+        slow_actor_action_abs_mean = mean_training_metric("actor_action_abs_mean", "slow")
+        fast_actor_reference_deviation_rms = mean_training_metric(
+            "actor_reference_deviation_rms", "fast"
+        )
+        slow_actor_reference_deviation_rms = mean_training_metric(
+            "actor_reference_deviation_rms", "slow"
+        )
+        fast_curtailment_action_mean = mean_training_metric(
+            "fast_curtailment_action_mean", "fast"
+        )
         writer.add_scalar("health/nonfinite_batch_count", nonfinite_batch_count, episode)
         for role, count in update_deltas.items():
             writer.add_scalar(f"health/{role}_updates_this_episode", count, episode)
@@ -3006,6 +3101,41 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         writer.add_scalar("health/mean_target_q_clipping_ratio", mean_target_q_clipping, episode)
         writer.add_scalar("health/mean_reward_clipping_ratio", mean_reward_clipping, episode)
         writer.add_scalar("health/mean_actor_action_saturation_ratio", mean_action_saturation, episode)
+        writer.add_scalar(
+            "health/fast_actor_action_saturation_ratio", fast_actor_action_saturation, episode
+        )
+        writer.add_scalar(
+            "health/slow_actor_action_saturation_ratio", slow_actor_action_saturation, episode
+        )
+        writer.add_scalar("health/fast_actor_action_abs_mean", fast_actor_action_abs_mean, episode)
+        writer.add_scalar("health/slow_actor_action_abs_mean", slow_actor_action_abs_mean, episode)
+        writer.add_scalar(
+            "health/fast_actor_reference_deviation_rms",
+            fast_actor_reference_deviation_rms,
+            episode,
+        )
+        writer.add_scalar(
+            "health/slow_actor_reference_deviation_rms",
+            slow_actor_reference_deviation_rms,
+            episode,
+        )
+        writer.add_scalar(
+            "health/fast_curtailment_action_mean", fast_curtailment_action_mean, episode
+        )
+        writer.add_scalar(
+            "health/slow_raw_to_guard_projection_rms",
+            math.sqrt(max(slow_raw_to_guard_projection_mse, 0.0)), episode,
+        )
+        writer.add_scalar(
+            "health/slow_guard_to_executed_projection_rms",
+            math.sqrt(max(slow_guard_to_executed_projection_mse, 0.0)), episode,
+        )
+        writer.add_scalar(
+            "health/slow_global_safety_group_share", slow_global_safety_group_share, episode
+        )
+        writer.add_scalar(
+            "health/slow_role_specific_group_share", slow_role_specific_group_share, episode
+        )
         writer.add_scalar("health/mean_dynamic_projection_rms",
                           math.sqrt(max(mean_dynamic_projection_mse, 0.0)), episode)
 
@@ -3031,13 +3161,50 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             LOGGER.warning("Training clipping ratio exceeded %.3f in episode %s (target_q=%.3f reward=%.3f).",
                            clip_limit, episode, mean_target_q_clipping, mean_reward_clipping)
         saturation_limit = float(getattr(cfg, "health_action_saturation_warning_ratio", 0.90))
-        if mean_action_saturation > saturation_limit:
-            LOGGER.warning("Actor action saturation ratio %.3f exceeded %.3f in episode %s.",
-                           mean_action_saturation, saturation_limit, episode)
+        for role, value in (
+            ("fast", fast_actor_action_saturation), ("slow", slow_actor_action_saturation)
+        ):
+            has_actor_saturation = any(
+                name.startswith(f"training_batch/{role}/")
+                and name.endswith("actor_action_saturation_ratio")
+                for name in episode_training_metrics
+            )
+            actor_saturation_episodes[role] = (
+                actor_saturation_episodes[role] + 1
+                if has_actor_saturation and value > saturation_limit else 0
+            )
+            if actor_saturation_episodes[role] >= patience:
+                LOGGER.warning(
+                    "%s Actor saturation ratio %.3f exceeded %.3f for %s episodes.",
+                    role, value, saturation_limit, actor_saturation_episodes[role],
+                )
+        collapse_limit = float(getattr(cfg, "health_actor_collapse_warning_abs_mean", 0.0))
+        for role, value in (
+            ("fast", fast_actor_action_abs_mean), ("slow", slow_actor_action_abs_mean)
+        ):
+            has_actor_update = any(
+                name.startswith(f"training_batch/{role}/")
+                and name.endswith("actor_action_abs_mean")
+                for name in episode_training_metrics
+            )
+            actor_collapse_episodes[role] = (
+                actor_collapse_episodes[role] + 1
+                if has_actor_update and collapse_limit > 0.0 and value < collapse_limit
+                else 0
+            )
+            if actor_collapse_episodes[role] >= patience:
+                LOGGER.warning(
+                    "%s Actor deterministic absolute action mean %.5f remained below %.5f "
+                    "for %s episodes; possible policy collapse.",
+                    role, value, collapse_limit, actor_collapse_episodes[role],
+                )
         projection_limit = float(getattr(cfg, "health_projection_warning_rms", 0.25))
-        if math.sqrt(max(mean_dynamic_projection_mse, 0.0)) > projection_limit:
-            LOGGER.warning("Dynamic projection RMS %.3f exceeded %.3f in episode %s.",
-                           math.sqrt(max(mean_dynamic_projection_mse, 0.0)), projection_limit, episode)
+        slow_raw_guard_rms = math.sqrt(max(slow_raw_to_guard_projection_mse, 0.0))
+        if slow_raw_guard_rms > projection_limit:
+            LOGGER.warning(
+                "Slow raw-to-guard projection RMS %.3f exceeded %.3f in episode %s.",
+                slow_raw_guard_rms, projection_limit, episode,
+            )
         writer.add_scalar("episode/return", episode_return, episode)
         writer.add_scalar("episode/manager_return", manager_return, episode)
         writer.add_scalar("episode/fast_buffer_size", len(fast_buffer), episode)
@@ -3066,6 +3233,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         eval_gas_success_rate: Any = ""
         eval_mean_voltage_rms: Any = ""
         eval_mean_gas_pressure_rms: Any = ""
+        early_stop_requested = False
         if (episode + 1) % max(1, cfg.eval_interval) == 0 or episode == cfg.episodes - 1:
             eval_stats = evaluate_policy(agents, cfg, episodes=cfg.eval_episodes, max_steps=cfg.episode_steps,
                                          seed=cfg.seed + 10_000 + episode)
@@ -3083,14 +3251,26 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                               eval_stats["mean_voltage_rms_deviation_pu"], episode)
             writer.add_scalar("eval/mean_gas_pressure_rms_deviation_bar",
                               eval_stats["mean_gas_pressure_rms_deviation_bar"], episode)
-            if is_better_evaluation(eval_stats, best_metric_state, cfg):
+            evaluation_improved = is_better_evaluation(eval_stats, best_metric_state, cfg)
+            if evaluation_improved:
                 best_eval_return = eval_stats["mean_return"]
                 best_metric_state = metric_state_from_evaluation(eval_stats, cfg)
                 best_evaluation_stats = dict(eval_stats)
+                joint_evaluations_without_improvement = 0
                 save_best_files(
                     run_root, agents, cfg, episode, global_step, best_eval_return,
                     best_metric_state, best_evaluation_stats,
                     fast_buffer, slow_buffer, manager_buffer, episode + 1,
+                )
+            elif cfg.training_stage == "joint_finetune":
+                joint_evaluations_without_improvement += 1
+            if cfg.training_stage == "joint_finetune":
+                writer.add_scalar(
+                    "health/joint_evaluations_without_improvement",
+                    joint_evaluations_without_improvement, episode,
+                )
+                early_stop_requested = should_early_stop_joint(
+                    cfg, episode + 1, joint_evaluations_without_improvement
                 )
         save_checkpoint(
             run_root / "latest_policy.pt", cfg, agents, episode, global_step, best_eval_return,
@@ -3099,7 +3279,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             checkpoint_kind="lightweight",
         )
         if ((episode + 1) % int(cfg.full_resume_checkpoint_interval) == 0
-                or episode == cfg.episodes - 1):
+                or episode == cfg.episodes - 1 or early_stop_requested):
             save_checkpoint(
                 run_root / "resume_latest.pt", cfg, agents, episode, global_step, best_eval_return,
                 best_metric_state, best_evaluation_stats,
@@ -3167,7 +3347,32 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             "mean_target_q_clipping_ratio": mean_target_q_clipping,
             "mean_reward_clipping_ratio": mean_reward_clipping,
             "mean_actor_action_saturation_ratio": mean_action_saturation,
+            "fast_actor_action_abs_mean": fast_actor_action_abs_mean,
+            "slow_actor_action_abs_mean": slow_actor_action_abs_mean,
+            "fast_actor_action_saturation_ratio": fast_actor_action_saturation,
+            "slow_actor_action_saturation_ratio": slow_actor_action_saturation,
+            "fast_actor_reference_deviation_rms": fast_actor_reference_deviation_rms,
+            "slow_actor_reference_deviation_rms": slow_actor_reference_deviation_rms,
+            "fast_curtailment_action_mean": fast_curtailment_action_mean,
+            "slow_raw_to_guard_projection_rms": slow_raw_guard_rms,
+            "slow_guard_to_executed_projection_rms": math.sqrt(
+                max(slow_guard_to_executed_projection_mse, 0.0)
+            ),
+            "slow_global_safety_group_share": slow_global_safety_group_share,
+            "slow_role_specific_group_share": slow_role_specific_group_share,
+            "joint_evaluations_without_improvement": joint_evaluations_without_improvement,
+            "early_stop_requested": float(early_stop_requested),
         })
+        completed_next_episode = episode + 1
+        if early_stop_requested:
+            early_stopped = True
+            LOGGER.info(
+                "Joint safety early stop at episode %s after %s evaluations without a "
+                "better feasible-first metric (minimum episodes=%s).",
+                episode, joint_evaluations_without_improvement,
+                int(getattr(cfg, "joint_early_stop_min_episodes", 0)),
+            )
+            break
 
     writer.close()
     LOGGER.info("Training complete. Checkpoints: %s", run_root)
@@ -3181,7 +3386,9 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
     return {
         "run_root": str(run_root),
         "global_step": global_step,
-        "next_episode": start_episode if cfg.episodes <= start_episode else cfg.episodes,
+        "next_episode": completed_next_episode,
+        "early_stopped": early_stopped,
+        "joint_evaluations_without_improvement": joint_evaluations_without_improvement,
         "best_eval_return": best_eval_return,
         "best_metric_state": best_metric_state,
         "best_evaluation_stats": best_evaluation_stats,

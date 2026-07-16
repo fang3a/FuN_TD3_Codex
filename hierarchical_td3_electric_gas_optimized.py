@@ -67,7 +67,7 @@ MANAGER_INTERVAL = legacy.MANAGER_INTERVAL
 EPISODE_STEPS = legacy.EPISODE_STEPS
 GOAL_DIM = legacy.GOAL_DIM
 GOAL_PHYSICAL_SLICE = slice(24, 32)
-ALGORITHM_VERSION = "safety-smdp-td3-v9-reward-calibrated"
+ALGORITHM_VERSION = "safety-smdp-td3-v11-guard-credit-calibrated"
 
 ObservationBuilder = legacy.ObservationBuilder
 AgentBundle = legacy.AgentBundle
@@ -123,7 +123,7 @@ class TrainConfig(legacy.TrainConfig):
     manager_lr: float = 5e-5
     joint_worker_lr: float = 5e-5
     joint_manager_lr: float = 1e-5
-    joint_policy_frequency: int = 4
+    joint_policy_frequency: int = 6
 
     projection_imitation_weight: float = 0.10  # 旧字段，保存兼容性。
     projection_imitation_initial_weight: float = 0.10
@@ -131,6 +131,7 @@ class TrainConfig(legacy.TrainConfig):
     projection_imitation_decay_updates: int = 100_000
     projection_imitation_threshold: float = 1e-3
     projection_behavior_match_threshold: float = 0.05
+    slow_guard_imitation_multiplier: float = 5.0
 
     use_prioritized_replay: bool = True
     priority_alpha: float = 0.6
@@ -163,10 +164,12 @@ class TrainConfig(legacy.TrainConfig):
     strict_stage_sample_validation: bool = True
     debug_terminal_soc_penalty: bool = True
     reward_component_transform: str = "log1p_reference"
-    reward_scale_profile: str = "safety_calibrated_20260714_v1"
+    reward_scale_profile: str = "safety_calibrated_20260716_v2"
+    slow_role_specific_reward_scale: float = 25.0
     shaping_reference_floor: float = 1.0
-    adaptive_auxiliary_loss_scaling: bool = True
+    adaptive_auxiliary_loss_scaling: bool = False
     auxiliary_loss_scale_max: float = 1_000_000.0
+    auxiliary_loss_coefficient_max: float = 0.05
     worker_component_clip_abs: float = 50.0
     fast_global_safety_weight: float = 0.50
     fast_role_specific_weight: float = 0.50
@@ -176,11 +179,19 @@ class TrainConfig(legacy.TrainConfig):
     health_clip_warning_ratio: float = 0.05
     health_action_saturation_warning_ratio: float = 0.30
     health_projection_warning_rms: float = 0.20
+    health_actor_collapse_warning_abs_mean: float = 0.03
+
+    # Joint fine-tuning starts from the transferred safety candidate.  Keeping the
+    # Manager deterministic initially reduces simultaneous three-policy drift.
+    inherit_stage_best_on_joint_transfer: bool = True
+    joint_freeze_manager_actor_episodes: int = 10
+    joint_early_stop_patience_evaluations: int = 3
+    joint_early_stop_min_episodes: int = 20
 
     fast_pretrain_episodes: int = 50
     slow_pretrain_episodes: int = 50
     manager_train_episodes: int = 50
-    joint_finetune_episodes: int = 100
+    joint_finetune_episodes: int = 30
     eval_episodes: int = 3
     eval_seeds: Tuple[int, ...] = (20_026, 20_027, 20_028)
     eval_seed_mode: str = "fixed"
@@ -284,7 +295,7 @@ class TrainConfig(legacy.TrainConfig):
         require("prioritized_sample_fraction", 0.0 <= self.prioritized_sample_fraction <= 1.0,
                 "0 <= prioritized_sample_fraction <= 1")
         for name in ("projection_imitation_weight", "projection_imitation_initial_weight",
-                     "projection_imitation_final_weight"):
+                     "projection_imitation_final_weight", "slow_guard_imitation_multiplier"):
             require(name, np.isfinite(float(getattr(self, name))) and float(getattr(self, name)) >= 0.0,
                     f"{name} must be finite and >= 0")
         require("projection_imitation_decay_updates", int(self.projection_imitation_decay_updates) > 0,
@@ -302,10 +313,10 @@ class TrainConfig(legacy.TrainConfig):
                 f"reward_component_transform={self.reward_component_transform!r} must be "
                 "'none' or 'log1p_reference'"
             )
-        if self.reward_scale_profile != "safety_calibrated_20260714_v1":
+        if self.reward_scale_profile != "safety_calibrated_20260716_v2":
             raise ValueError(
                 f"Unsupported reward_scale_profile={self.reward_scale_profile!r}; "
-                "expected 'safety_calibrated_20260714_v1'"
+                "expected 'safety_calibrated_20260716_v2'"
             )
         require("shaping_reference_floor",
                 np.isfinite(self.shaping_reference_floor) and self.shaping_reference_floor > 0.0,
@@ -313,6 +324,10 @@ class TrainConfig(legacy.TrainConfig):
         require("auxiliary_loss_scale_max",
                 np.isfinite(self.auxiliary_loss_scale_max) and self.auxiliary_loss_scale_max > 0.0,
                 "auxiliary_loss_scale_max must be finite and > 0")
+        require("auxiliary_loss_coefficient_max",
+                np.isfinite(self.auxiliary_loss_coefficient_max)
+                and self.auxiliary_loss_coefficient_max > 0.0,
+                "auxiliary_loss_coefficient_max must be finite and > 0")
         require("episode_steps", int(self.episode_steps) > 0, "episode_steps > 0")
         require("episode_steps", int(self.episode_steps) <= int(DEFAULT_CONFIG.time.steps_per_day),
                 f"episode_steps <= steps_per_day ({DEFAULT_CONFIG.time.steps_per_day}); cross-day episodes are unsupported")
@@ -347,7 +362,7 @@ class TrainConfig(legacy.TrainConfig):
                     f"{name} must be finite and >= 0")
         for name in ("worker_component_clip_abs", "fast_global_safety_weight",
                      "fast_role_specific_weight", "slow_global_safety_weight",
-                     "slow_role_specific_weight"):
+                     "slow_role_specific_weight", "slow_role_specific_reward_scale"):
             require(name, np.isfinite(float(getattr(self, name))) and float(getattr(self, name)) >= 0.0,
                     f"{name} must be finite and >= 0")
         if self.fast_global_safety_weight + self.fast_role_specific_weight <= 0.0:
@@ -423,6 +438,19 @@ class TrainConfig(legacy.TrainConfig):
         require("health_projection_warning_rms",
                 np.isfinite(self.health_projection_warning_rms) and self.health_projection_warning_rms >= 0.0,
                 "health_projection_warning_rms must be finite and >= 0")
+        require("health_actor_collapse_warning_abs_mean",
+                np.isfinite(self.health_actor_collapse_warning_abs_mean)
+                and self.health_actor_collapse_warning_abs_mean >= 0.0,
+                "health_actor_collapse_warning_abs_mean must be finite and >= 0")
+        require("joint_freeze_manager_actor_episodes",
+                int(self.joint_freeze_manager_actor_episodes) >= 0,
+                "joint_freeze_manager_actor_episodes must be >= 0")
+        require("joint_early_stop_patience_evaluations",
+                int(self.joint_early_stop_patience_evaluations) > 0,
+                "joint_early_stop_patience_evaluations must be > 0")
+        require("joint_early_stop_min_episodes",
+                int(self.joint_early_stop_min_episodes) >= 0,
+                "joint_early_stop_min_episodes must be >= 0")
         require("full_resume_checkpoint_interval", int(self.full_resume_checkpoint_interval) > 0,
                 "full_resume_checkpoint_interval > 0")
         for name in ("min_power_success_rate", "min_gas_success_rate", "max_soc_violation_rate",
@@ -589,7 +617,65 @@ def adaptive_auxiliary_weight(primary_loss: torch.Tensor, auxiliary_loss: torch.
     primary = float(primary_loss.detach().abs().cpu())
     auxiliary = float(auxiliary_loss.detach().abs().cpu())
     scale = primary / max(auxiliary, 1e-8)
-    return float(relative_weight * min(scale, cfg.auxiliary_loss_scale_max))
+    coefficient = float(relative_weight * min(scale, cfg.auxiliary_loss_scale_max))
+    # Without an absolute coefficient cap, an auxiliary loss approaching zero
+    # produces an increasingly strong gradient despite a small loss contribution.
+    # That feedback caused both Workers to collapse to normalized zero actions.
+    return float(min(coefficient, cfg.auxiliary_loss_coefficient_max))
+
+
+def worker_action_regularization_reference(
+    raw_observations: torch.Tensor,
+    role: str,
+    action_dim: int,
+) -> torch.Tensor:
+    """Return the reference action in the Actor's exact normalized coordinates.
+
+    Fast action zero is not physically neutral: the last half controls renewable
+    curtailment and zero requests half of the allowed curtailment.  Its neutral
+    reference is therefore ``[Q=0, curtailment=-1]``.  Slow actions are regularized
+    relative to the action already held by the environment, which is present in the
+    compact Markov observation, rather than toward midpoint GFG/P2G/compressor output.
+    """
+
+    if raw_observations.ndim != 2:
+        raise ValueError(
+            f"raw_observations must be [batch, obs_dim], got shape={tuple(raw_observations.shape)}"
+        )
+    if role == "fast":
+        if action_dim <= 0 or action_dim % 2 != 0:
+            raise ValueError(f"Fast action_dim must be a positive even value, got {action_dim}")
+        reference = torch.zeros(
+            (raw_observations.shape[0], action_dim),
+            dtype=raw_observations.dtype,
+            device=raw_observations.device,
+        )
+        reference[:, action_dim // 2:] = -1.0
+        return reference
+    if role == "slow":
+        held_slice = legacy.SLOW_OBSERVATION_LAYOUT.slices["held_slow_action"]
+        if held_slice.stop is None or held_slice.stop > raw_observations.shape[1]:
+            expected_action_dim = held_slice.stop - held_slice.start
+            if action_dim != expected_action_dim:
+                # Compact synthetic-network tests intentionally use a smaller action
+                # space and do not represent the real environment contract.
+                return torch.zeros(
+                    (raw_observations.shape[0], action_dim),
+                    dtype=raw_observations.dtype,
+                    device=raw_observations.device,
+                )
+            raise ValueError(
+                "Slow observation cannot provide held_slow_action: "
+                f"obs_dim={raw_observations.shape[1]}, expected_stop={held_slice.stop}"
+            )
+        reference = raw_observations[:, held_slice]
+        if reference.shape[1] != action_dim:
+            raise ValueError(
+                f"held_slow_action size={reference.shape[1]}, expected action_dim={action_dim}"
+            )
+        require_finite_tensor("slow/action_regularization_reference", reference)
+        return reference.clamp(-1.0, 1.0)
+    raise ValueError(f"Unknown Worker role={role!r}")
 
 
 def projection_imitation_masks(
@@ -610,6 +696,43 @@ def projection_imitation_masks(
     projection_mask = projection_rms > float(projection_threshold)
     behavior_match_mask = behavior_rms < float(behavior_match_threshold)
     return projection_mask, behavior_match_mask, projection_mask & behavior_match_mask
+
+
+def projection_imitation_element_mask(
+    current_actor_actions: torch.Tensor,
+    historical_raw_actions: torch.Tensor,
+    guarded_actions: torch.Tensor,
+    projection_threshold: float,
+    behavior_match_threshold: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select only action dimensions actually changed by the safety guard.
+
+    The old sample-level mask imitated all ten Slow dimensions whenever any ESS
+    dimension was guarded.  That copied unrelated GFG/P2G/compressor behavior and
+    diluted the ESS safety signal.  The element mask keeps the conservative
+    behavior-support check per sample but supervises only projected dimensions.
+    """
+
+    if not (
+        current_actor_actions.shape == historical_raw_actions.shape == guarded_actions.shape
+    ):
+        raise ValueError(
+            "Projection imitation tensors must share shape, got "
+            f"actor={tuple(current_actor_actions.shape)}, "
+            f"raw={tuple(historical_raw_actions.shape)}, "
+            f"guarded={tuple(guarded_actions.shape)}"
+        )
+    projected_elements = (
+        historical_raw_actions - guarded_actions
+    ).abs() > float(projection_threshold)
+    behavior_rms = torch.sqrt(
+        torch.mean(
+            (current_actor_actions.detach() - historical_raw_actions).pow(2), dim=-1
+        ) + 1e-12
+    )
+    behavior_supported = behavior_rms < float(behavior_match_threshold)
+    imitation_elements = projected_elements & behavior_supported[:, None]
+    return projected_elements, behavior_supported, imitation_elements
 
 
 # =============================================================================
@@ -1246,6 +1369,8 @@ class SlowReplayBuffer(_PrioritizedReplayMixin, legacy.SlowReplayBuffer):
         self.last_executed_actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.executed_action_variance = np.zeros((capacity, action_dim), dtype=np.float32)
         self.max_dynamic_projection = np.zeros((capacity, 1), dtype=np.float32)
+        self.raw_to_guard_projection_rms = np.zeros((capacity, 1), dtype=np.float32)
+        self.guard_to_executed_projection_rms = np.zeros((capacity, 1), dtype=np.float32)
         self.mean_executed_actions = np.zeros((capacity, action_dim), dtype=np.float32)
         self.executed_action_sequences = np.zeros(
             (capacity, self.max_sequence_steps, action_dim), dtype=np.float32
@@ -1342,9 +1467,19 @@ class SlowReplayBuffer(_PrioritizedReplayMixin, legacy.SlowReplayBuffer):
         self.reward_global_safety[slot, 0] = reward_global_safety
         self.reward_role_specific[slot, 0] = reward_role_specific
         self.reward_raw_total[slot, 0] = reward_raw_total
-        # Dynamic projection is the guard command versus the discounted mean
-        # actually executed throughout the SMDP holding interval.
-        self.projection_scores[slot] = self._normalize_projection_mse(guarded, executed_action)
+        raw_guard_mse = float(np.mean(np.square(np.asarray(raw_action) - guarded)))
+        guard_executed_mse = float(np.mean(np.square(guarded - np.asarray(executed_action))))
+        self.raw_to_guard_projection_rms[slot, 0] = math.sqrt(max(raw_guard_mse, 0.0))
+        self.guard_to_executed_projection_rms[slot, 0] = math.sqrt(
+            max(guard_executed_mse, 0.0)
+        )
+        # PER must see the largest safety intervention.  In the diagnosed run
+        # raw->ESS-guard RMS was 0.475 while guard->environment was ~0, so using
+        # only the latter made projection priority effectively vanish.
+        self.projection_scores[slot] = max(
+            self._normalize_projection_mse(raw_action, guarded),
+            self._normalize_projection_mse(guarded, executed_action),
+        )
         self._set_new_priority(slot, size_before)
 
     def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
@@ -1360,6 +1495,12 @@ class SlowReplayBuffer(_PrioritizedReplayMixin, legacy.SlowReplayBuffer):
             "last_executed_actions": legacy.to_tensor(self.last_executed_actions[indices], self.device),
             "executed_action_variance": legacy.to_tensor(self.executed_action_variance[indices], self.device),
             "max_dynamic_projection": legacy.to_tensor(self.max_dynamic_projection[indices], self.device),
+            "raw_to_guard_projection_rms": legacy.to_tensor(
+                self.raw_to_guard_projection_rms[indices], self.device
+            ),
+            "guard_to_executed_projection_rms": legacy.to_tensor(
+                self.guard_to_executed_projection_rms[indices], self.device
+            ),
             "mean_executed_actions": legacy.to_tensor(self.mean_executed_actions[indices], self.device),
             "executed_action_sequences": legacy.to_tensor(
                 self.executed_action_sequences[indices], self.device
@@ -1397,7 +1538,9 @@ class SlowReplayBuffer(_PrioritizedReplayMixin, legacy.SlowReplayBuffer):
         for name in ("external_reward", "physical_progress", "projection_penalty",
                      "segment_constraint_mean", "segment_constraint_max", "guarded_actions",
                      "first_executed_actions", "last_executed_actions",
-                     "executed_action_variance", "max_dynamic_projection", "mean_executed_actions",
+                     "executed_action_variance", "max_dynamic_projection",
+                     "raw_to_guard_projection_rms", "guard_to_executed_projection_rms",
+                     "mean_executed_actions",
                      "executed_action_sequences", "executed_action_sequence_lengths",
                      "reward_global_safety", "reward_role_specific", "reward_raw_total"):
             state[name] = getattr(self, name)[:stored_size].copy()
@@ -1410,7 +1553,9 @@ class SlowReplayBuffer(_PrioritizedReplayMixin, legacy.SlowReplayBuffer):
         for name in ("external_reward", "physical_progress", "projection_penalty",
                      "segment_constraint_mean", "segment_constraint_max", "guarded_actions",
                      "first_executed_actions", "last_executed_actions",
-                     "executed_action_variance", "max_dynamic_projection", "mean_executed_actions",
+                     "executed_action_variance", "max_dynamic_projection",
+                     "raw_to_guard_projection_rms", "guard_to_executed_projection_rms",
+                     "mean_executed_actions",
                      "executed_action_sequences", "executed_action_sequence_lengths",
                      "reward_global_safety", "reward_role_specific", "reward_raw_total"):
             target = getattr(self, name)
@@ -1943,7 +2088,10 @@ class ManagerTD3(legacy.ManagerTD3):
         actor_loss_value = 0.0
         actor_grad = 0.0
         actor_saturation_ratio = 0.0
-        actor_update = self.total_updates % self.cfg.policy_frequency == 0
+        actor_update = (
+            any(parameter.requires_grad for parameter in self.actor.parameters())
+            and self.total_updates % self.cfg.policy_frequency == 0
+        )
         if actor_update:
             actor_data = buffer.sample_uniform(batch_size)
             actor_obs = legacy.to_tensor(
@@ -2263,14 +2411,23 @@ class WorkerTD3(legacy.WorkerTD3):
         behavior_match_ratio = 0.0
         imitation_mask_ratio = 0.0
         imitation_weight_value = projection_imitation_weight(self.cfg, self.total_updates)
+        if self.role == "slow":
+            imitation_weight_value *= float(self.cfg.slow_guard_imitation_multiplier)
         imitation_effective_weight = 0.0
         imitation_contribution_ratio = 0.0
         action_regularization_effective_weight = 0.0
         action_regularization_contribution_ratio = 0.0
         actor_saturation_ratio = 0.0
-        actor_update = self.total_updates % self.cfg.policy_frequency == 0
+        actor_action_abs_mean = 0.0
+        actor_reference_deviation_rms = 0.0
+        fast_curtailment_action_mean = 0.0
+        actor_update = (
+            any(parameter.requires_grad for parameter in self.actor.parameters())
+            and self.total_updates % self.cfg.policy_frequency == 0
+        )
         if actor_update:
             actor_data = buffer.sample_uniform(batch_size)
+            actor_raw_obs = actor_data["obs"].to(self.device)
             actor_obs = legacy.to_tensor(
                 self.normalizer.normalize(actor_data["obs"].cpu().numpy()), self.device
             )
@@ -2284,9 +2441,20 @@ class WorkerTD3(legacy.WorkerTD3):
                 actor_saturation_ratio = float(
                     (actor_raw_actions.abs() >= 0.98).float().mean().detach().cpu()
                 )
+                actor_action_abs_mean = float(actor_raw_actions.abs().mean().detach().cpu())
                 policy_loss = -self.critic.q_min(z_pi, actor_wg, actor_raw_actions).mean()
                 actor_loss = policy_loss
-                action_regularization = actor_raw_actions.pow(2).mean()
+                action_reference = worker_action_regularization_reference(
+                    actor_raw_obs, self.role, actor_raw_actions.shape[-1]
+                )
+                action_regularization = (actor_raw_actions - action_reference).pow(2).mean()
+                actor_reference_deviation_rms = float(
+                    torch.sqrt(action_regularization.detach().clamp_min(0.0)).cpu()
+                )
+                if self.role == "fast":
+                    fast_curtailment_action_mean = float(
+                        actor_raw_actions[:, actor_raw_actions.shape[-1] // 2:].mean().detach().cpu()
+                    )
                 action_regularization_effective_weight = adaptive_auxiliary_weight(
                     policy_loss, action_regularization, self.cfg.worker_action_l2_weight, self.cfg
                 )
@@ -2299,17 +2467,24 @@ class WorkerTD3(legacy.WorkerTD3):
                         policy_loss.detach().abs().clamp_min(1e-8)
                     ).cpu()
                 )
-                projection_mask, behavior_match_mask, imitation_mask = projection_imitation_masks(
-                    actor_raw_actions, actor_historical_raw, actor_imitation_actions,
-                    self.cfg.projection_imitation_threshold,
-                    self.cfg.projection_behavior_match_threshold,
+                projected_elements, behavior_match_mask, imitation_elements = (
+                    projection_imitation_element_mask(
+                        actor_raw_actions, actor_historical_raw, actor_imitation_actions,
+                        self.cfg.projection_imitation_threshold,
+                        self.cfg.projection_behavior_match_threshold,
+                    )
                 )
-                projection_mask_ratio = float(projection_mask.float().mean().detach().cpu())
+                projection_mask_ratio = float(
+                    projected_elements.float().mean().detach().cpu()
+                )
                 behavior_match_ratio = float(behavior_match_mask.float().mean().detach().cpu())
-                imitation_mask_ratio = float(imitation_mask.float().mean().detach().cpu())
-                if bool(imitation_mask.any()) and imitation_weight_value > 0.0:
+                imitation_mask_ratio = float(
+                    imitation_elements.float().mean().detach().cpu()
+                )
+                if bool(imitation_elements.any()) and imitation_weight_value > 0.0:
                     imitation_loss = F.mse_loss(
-                        actor_raw_actions[imitation_mask], actor_imitation_actions[imitation_mask]
+                        actor_raw_actions[imitation_elements],
+                        actor_imitation_actions[imitation_elements],
                     )
                     imitation_effective_weight = adaptive_auxiliary_weight(
                         policy_loss, imitation_loss, imitation_weight_value, self.cfg
@@ -2351,6 +2526,9 @@ class WorkerTD3(legacy.WorkerTD3):
         self.total_updates += 1
         prefix = f"training_batch/{self.role}/"
         reward_clipping_ratio = float(reward_clipped.mean().detach().cpu())
+        reward_group_denominator = (
+            reward_global_safety.abs().mean() + reward_role_specific.abs().mean()
+        ).clamp_min(1e-8)
         logs = {
             prefix + "critic_loss": float(critic_loss.detach().cpu()),
             prefix + "actor_loss": actor_loss_value,
@@ -2384,7 +2562,6 @@ class WorkerTD3(legacy.WorkerTD3):
             prefix + "transition_grad_norm": transition_grad,
             prefix + "reward_clipping_ratio": reward_clipping_ratio,
             prefix + "target_q_clipping_ratio": target_q_clipping_ratio,
-            prefix + "actor_action_saturation_ratio": actor_saturation_ratio,
             prefix + "reward_external_mean": float(reward_external.mean().detach().cpu()),
             prefix + "reward_global_safety_mean": float(reward_global_safety.mean().detach().cpu()),
             prefix + "reward_global_safety_std": float(reward_global_safety.std(unbiased=False).detach().cpu()),
@@ -2414,11 +2591,24 @@ class WorkerTD3(legacy.WorkerTD3):
             prefix + "role_specific_abs_contribution_ratio": float(
                 reward_role_specific.abs().mean().div(reward_raw.abs().mean().clamp_min(1e-8)).detach().cpu()
             ),
+            prefix + "global_safety_group_share": float(
+                reward_global_safety.abs().mean().div(reward_group_denominator).detach().cpu()
+            ),
+            prefix + "role_specific_group_share": float(
+                reward_role_specific.abs().mean().div(reward_group_denominator).detach().cpu()
+            ),
             prefix + "mean_duration_steps": float(durations.mean().detach().cpu()),
             prefix + "critic_raw_action_mean": float(raw_actions.mean().detach().cpu()),
             prefix + "executed_action_mean": float(executed_actions.mean().detach().cpu()),
             prefix + "priority_fallback_count": float(getattr(buffer, "priority_fallback_count", 0)),
         }
+        if actor_update:
+            logs.update({
+                prefix + "actor_action_saturation_ratio": actor_saturation_ratio,
+                prefix + "actor_action_abs_mean": actor_action_abs_mean,
+                prefix + "actor_reference_deviation_rms": actor_reference_deviation_rms,
+                prefix + "fast_curtailment_action_mean": fast_curtailment_action_mean,
+            })
         logs.update({prefix + "replay/" + key: value
                      for key, value in getattr(buffer, "last_sampling_diagnostics", {}).items()})
         return logs
@@ -2770,6 +2960,8 @@ def _critical_optimization_config(cfg: TrainConfig) -> Dict[str, Any]:
         "alpha_external", "beta_latent", "beta_physical", "lambda_projection",
         "shaping_reference_floor", "reward_component_transform", "reward_scale_profile",
         "adaptive_auxiliary_loss_scaling", "auxiliary_loss_scale_max",
+        "auxiliary_loss_coefficient_max", "worker_action_l2_weight",
+        "slow_role_specific_reward_scale", "slow_guard_imitation_multiplier",
         "use_prioritized_replay", "priority_alpha", "constraint_priority_weight",
         "projection_priority_weight", "projection_behavior_match_threshold",
         "fast_priority_beta_anneal_updates", "slow_priority_beta_anneal_updates",
@@ -2783,7 +2975,9 @@ def _critical_optimization_config(cfg: TrainConfig) -> Dict[str, Any]:
         "goal_smoothing", "goal_change_penalty_weight", "worker_component_clip_abs",
         "fast_global_safety_weight", "fast_role_specific_weight",
         "slow_global_safety_weight", "slow_role_specific_weight",
-        "joint_policy_frequency",
+        "joint_policy_frequency", "joint_freeze_manager_actor_episodes",
+        "inherit_stage_best_on_joint_transfer",
+        "joint_early_stop_patience_evaluations", "joint_early_stop_min_episodes",
     )
     return {name: getattr(cfg, name) for name in names}
 
@@ -3360,10 +3554,17 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                 continue
             critic_delta = int(result[f"{role}_critic_update_count"]) - initial_updates[role + "_critic"]
             actor_delta = int(result[f"{role}_actor_update_count"]) - initial_updates[role + "_actor"]
-            if critic_delta <= 0 or actor_delta <= 0:
+            actor_deliberately_frozen = bool(
+                cfg.training_stage == "joint_finetune"
+                and role == "manager"
+                and int(resume_next_episode) < int(cfg.joint_freeze_manager_actor_episodes)
+                and int(cfg.episodes) <= int(cfg.joint_freeze_manager_actor_episodes)
+            )
+            if critic_delta <= 0 or (actor_delta <= 0 and not actor_deliberately_frozen):
                 raise RuntimeError(
                     f"Invalid training run: trainable {role} made critic_delta={critic_delta}, "
-                    f"actor_delta={actor_delta}; sample_budget={sample_budget[role]}"
+                    f"actor_delta={actor_delta}, deliberately_frozen={actor_deliberately_frozen}; "
+                    f"sample_budget={sample_budget[role]}"
                 )
     result["sample_budget"] = sample_budget
     return result
@@ -3485,6 +3686,13 @@ def _test_reward_scale_calibration() -> None:
         assert np.all(np.isfinite(np.asarray(values, dtype=float)))
     assert fast["global_used"] < 0.0 and fast["role_used"] < 0.0
     assert slow["global_used"] < 0.0 and slow["role_used"] < 0.0
+    assert slow["role_scale"] == cfg.slow_role_specific_reward_scale == 25.0
+    assert math.isclose(
+        slow["role_weighted"],
+        cfg.slow_role_specific_weight * cfg.slow_role_specific_reward_scale
+        * slow["role_used"],
+        rel_tol=1e-7,
+    )
     assert abs(manager["reward"]) < abs(manager["raw_reward"])
 
     shaped = legacy.build_worker_reward(-10.0, 1.0, 1.0, -0.5, cfg)
@@ -3497,7 +3705,40 @@ def _test_reward_scale_calibration() -> None:
     primary = torch.tensor(100.0)
     auxiliary = torch.tensor(2.0)
     coefficient = adaptive_auxiliary_weight(primary, auxiliary, 0.10, cfg)
-    assert math.isclose(coefficient * 2.0 / 100.0, 0.10, rel_tol=1e-6)
+    assert math.isclose(coefficient, 0.10, rel_tol=1e-6)
+    adaptive_cfg = copy.deepcopy(cfg)
+    adaptive_cfg.adaptive_auxiliary_loss_scaling = True
+    adaptive_cfg.auxiliary_loss_coefficient_max = 0.05
+    capped = adaptive_auxiliary_weight(
+        torch.tensor(100.0), torch.tensor(1e-12), 0.10, adaptive_cfg
+    )
+    assert math.isclose(capped, 0.05, rel_tol=1e-6)
+
+
+def _test_worker_action_regularization_reference() -> None:
+    batch = 3
+    fast_obs = torch.zeros((batch, 115), dtype=torch.float32)
+    fast_reference = worker_action_regularization_reference(fast_obs, "fast", 16)
+    assert fast_reference.shape == (batch, 16)
+    assert torch.all(fast_reference[:, :8] == 0.0)
+    assert torch.all(fast_reference[:, 8:] == -1.0)
+    # A zero Fast action is not neutral because it requests half of maximum curtailment.
+    assert math.isclose(
+        float((torch.zeros_like(fast_reference) - fast_reference).pow(2).mean()),
+        0.5,
+        rel_tol=1e-6,
+    )
+
+    slow_obs = torch.zeros(
+        (batch, legacy.SLOW_OBSERVATION_LAYOUT.dimension), dtype=torch.float32
+    )
+    held = torch.linspace(-0.8, 0.8, 10).repeat(batch, 1)
+    slow_obs[:, legacy.SLOW_OBSERVATION_LAYOUT.slices["held_slow_action"]] = held
+    slow_reference = worker_action_regularization_reference(slow_obs, "slow", 10)
+    assert slow_reference.shape == (batch, 10)
+    assert torch.allclose(slow_reference, held)
+    held[0, 0] = 1.0
+    assert slow_reference[0, 0] != held[0, 0], "reference must not alias Replay storage"
 
 
 def _test_manager_goal_semantics(device: torch.device) -> None:
@@ -3854,6 +4095,11 @@ def _test_slow_executed_action_summary() -> None:
     assert np.array_equal(
         restored.executed_action_sequence_lengths, buffer.executed_action_sequence_lengths
     )
+    assert buffer.raw_to_guard_projection_rms[0, 0] > 0.0
+    assert buffer.projection_scores[0] > 0.0
+    assert np.array_equal(
+        restored.raw_to_guard_projection_rms, buffer.raw_to_guard_projection_rms
+    )
     _LAST_SLOW_ACTOR_RAW = None
     _CURRENT_SLOW_PENDING = None
 
@@ -3873,6 +4119,15 @@ def _test_projection_schedule_and_mask() -> None:
     assert imitation_mask.tolist() == [True, False, False]
     empty_loss = torch.zeros((), dtype=torch.float32) if not bool((imitation_mask & False).any()) else current.sum()
     assert torch.isfinite(empty_loss) and float(empty_loss) == 0.0
+    guarded = historical_raw.clone()
+    guarded[0, 0] = 0.0
+    guarded[1, 1] = 0.0
+    projected_elements, supported, imitation_elements = projection_imitation_element_mask(
+        current, historical_raw, guarded, 0.01, 0.05
+    )
+    assert projected_elements.tolist() == [[True, False], [False, True], [False, False]]
+    assert supported.tolist() == [True, False, True]
+    assert imitation_elements.tolist() == [[True, False], [False, False], [False, False]]
 
 
 def _test_physical_features() -> None:
@@ -3958,6 +4213,7 @@ def _test_cli_contract() -> None:
         ("priority_alpha", -0.1), ("priority_epsilon", 0.0),
         ("constraint_priority_weight", -1.0), ("projection_priority_weight", -1.0),
         ("projection_imitation_initial_weight", -0.1),
+        ("slow_guard_imitation_multiplier", -0.1),
         ("projection_imitation_decay_updates", 0), ("fast_buffer_size", 0),
         ("fast_batch_size", 0), ("eval_interval", 0), ("eval_episodes", 0),
         ("worker_reward_clip_abs", -1.0), ("target_q_clip_abs", -1.0),
@@ -3968,6 +4224,8 @@ def _test_cli_contract() -> None:
         ("goal_smoothing", 1.1), ("prioritized_sample_fraction", 1.1),
         ("max_td_error_for_priority", float("inf")),
         ("manager_solver_priority_weight", -1.0),
+        ("slow_role_specific_reward_scale", -1.0),
+        ("joint_early_stop_patience_evaluations", 0),
         ("beta_latent", float("nan")),
     )
     for name, value in invalid_cases:
@@ -4715,6 +4973,16 @@ def _test_safe_best_model_metric() -> None:
     assert legacy.is_better_evaluation(nearly_equal, feasible_state, cfg), (
         "metric noise inside tolerance must not hide a meaningful return improvement"
     )
+    early_cfg = TrainConfig(
+        run_mode="debug", training_stage="joint_finetune",
+        joint_early_stop_min_episodes=20,
+        joint_early_stop_patience_evaluations=3,
+    )
+    assert not legacy.should_early_stop_joint(early_cfg, 19, 3)
+    assert not legacy.should_early_stop_joint(early_cfg, 20, 2)
+    assert legacy.should_early_stop_joint(early_cfg, 20, 3)
+    early_cfg.training_stage = "manager_train"
+    assert not legacy.should_early_stop_joint(early_cfg, 50, 10)
 
 
 def _test_stage_evaluation_and_runtime_restore(device: torch.device) -> None:
@@ -4922,6 +5190,10 @@ def _test_short_training() -> None:
         checkpoint_dir="hierarchical_td3_test_runs/optimized_joint_short",
         load_checkpoint=checkpoint_path, checkpoint_load_mode="stage_transfer", **common,
     )
+    # This test verifies that every trainable layer can update in one short
+    # episode.  The production joint schedule deliberately freezes the Manager
+    # actor at first, so disable that curriculum only for this update test.
+    joint_cfg.joint_freeze_manager_actor_episodes = 0
     joint_result = run_training(joint_cfg)
     for role in ("fast", "slow", "manager"):
         assert joint_result[f"{role}_critic_update_count"] > 0
@@ -4981,6 +5253,7 @@ def run_minimum_tests() -> None:
     legacy.set_seed(42)
     _test_smdp_discount()
     _test_reward_scale_calibration()
+    _test_worker_action_regularization_reference()
     _test_manager_goal_semantics(device)
     _test_pure_slow_action_inverse_mapping()
     _test_observation_layout()
@@ -5052,7 +5325,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--manager-lr", type=float, default=5e-5)
     parser.add_argument("--joint-worker-lr", type=float, default=5e-5)
     parser.add_argument("--joint-manager-lr", type=float, default=1e-5)
-    parser.add_argument("--joint-policy-frequency", type=int, default=4)
+    parser.add_argument("--joint-policy-frequency", type=int, default=6)
     parser.add_argument("--fast-buffer-size", type=int, default=200_000)
     parser.add_argument("--slow-buffer-size", type=int, default=50_000)
     parser.add_argument("--manager-buffer-size", type=int, default=10_000)
@@ -5061,6 +5334,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--projection-imitation-decay-updates", type=int, default=100_000)
     parser.add_argument("--projection-imitation-threshold", type=float, default=1e-3)
     parser.add_argument("--projection-behavior-match-threshold", type=float, default=0.05)
+    parser.add_argument("--slow-guard-imitation-multiplier", type=float, default=5.0)
     parser.add_argument("--projection-imitation-weight", type=float)
     parser.add_argument("--disable-prioritized-replay", action="store_true")
     parser.add_argument("--priority-alpha", type=float, default=0.6)
@@ -5084,7 +5358,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--fast-pretrain-episodes", type=int, default=50)
     parser.add_argument("--slow-pretrain-episodes", type=int, default=50)
     parser.add_argument("--manager-train-episodes", type=int, default=50)
-    parser.add_argument("--joint-finetune-episodes", type=int, default=100)
+    parser.add_argument("--joint-finetune-episodes", type=int, default=30)
     parser.add_argument("--eval-interval", type=int, default=5)
     parser.add_argument("--eval-episodes", type=int, default=3)
     parser.add_argument("--eval-seeds", type=int, nargs="+", default=[20_026, 20_027, 20_028])
@@ -5123,19 +5397,37 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--noise-decay-episodes", type=int, default=200)
     parser.add_argument("--goal-smoothing", type=float, default=0.20)
     parser.add_argument("--goal-change-penalty-weight", type=float, default=0.05)
-    parser.add_argument("--lambda-projection", type=float, default=5.0)
+    parser.add_argument("--lambda-projection", type=float, default=1.0)
     parser.add_argument("--worker-reward-clip-abs", type=float, default=1_000.0)
     parser.add_argument("--manager-reward-clip-abs", type=float, default=2_000.0)
-    parser.add_argument("--worker-action-l2-weight", type=float, default=0.02,
-                        help="Desired relative actor-loss share for action L2 regularization")
+    parser.add_argument("--worker-action-l2-weight", type=float, default=0.002,
+                        help="Reference-action regularization weight; zero is not a universal physical neutral action")
     parser.add_argument("--worker-component-clip-abs", type=float, default=50.0,
                         help="Per-component cap after reference normalization")
     parser.add_argument("--reward-component-transform", choices=("none", "log1p_reference"),
                         default="log1p_reference")
-    parser.add_argument("--reward-scale-profile", default="safety_calibrated_20260714_v1")
+    parser.add_argument("--reward-scale-profile", default="safety_calibrated_20260716_v2")
+    parser.add_argument("--slow-role-specific-reward-scale", type=float, default=25.0)
     parser.add_argument("--shaping-reference-floor", type=float, default=1.0)
     parser.add_argument("--auxiliary-loss-scale-max", type=float, default=1_000_000.0)
-    parser.add_argument("--disable-adaptive-auxiliary-loss-scaling", action="store_true")
+    parser.add_argument("--auxiliary-loss-coefficient-max", type=float, default=0.05)
+    auxiliary_group = parser.add_mutually_exclusive_group()
+    auxiliary_group.add_argument(
+        "--enable-adaptive-auxiliary-loss-scaling",
+        dest="adaptive_auxiliary_loss_scaling",
+        action="store_true",
+    )
+    auxiliary_group.add_argument(
+        "--disable-adaptive-auxiliary-loss-scaling",
+        dest="adaptive_auxiliary_loss_scaling",
+        action="store_false",
+    )
+    parser.set_defaults(adaptive_auxiliary_loss_scaling=False)
+    parser.add_argument("--health-actor-collapse-warning-abs-mean", type=float, default=0.03)
+    parser.add_argument("--joint-freeze-manager-actor-episodes", type=int, default=10)
+    parser.add_argument("--joint-early-stop-patience-evaluations", type=int, default=3)
+    parser.add_argument("--joint-early-stop-min-episodes", type=int, default=20)
+    parser.add_argument("--disable-joint-stage-best-inheritance", action="store_true")
     parser.add_argument("--fast-global-safety-weight", type=float, default=0.50)
     parser.add_argument("--fast-role-specific-weight", type=float, default=0.50)
     parser.add_argument("--slow-global-safety-weight", type=float, default=0.50)
@@ -5197,6 +5489,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         projection_imitation_decay_updates=imitation_decay,
         projection_imitation_threshold=args.projection_imitation_threshold,
         projection_behavior_match_threshold=args.projection_behavior_match_threshold,
+        slow_guard_imitation_multiplier=args.slow_guard_imitation_multiplier,
         use_prioritized_replay=not args.disable_prioritized_replay,
         priority_alpha=args.priority_alpha, priority_beta_initial=args.priority_beta_initial,
         priority_beta_final=args.priority_beta_final,
@@ -5256,13 +5549,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         worker_component_clip_abs=args.worker_component_clip_abs,
         reward_component_transform=args.reward_component_transform,
         reward_scale_profile=args.reward_scale_profile,
+        slow_role_specific_reward_scale=args.slow_role_specific_reward_scale,
         shaping_reference_floor=args.shaping_reference_floor,
-        adaptive_auxiliary_loss_scaling=not args.disable_adaptive_auxiliary_loss_scaling,
+        adaptive_auxiliary_loss_scaling=args.adaptive_auxiliary_loss_scaling,
         auxiliary_loss_scale_max=args.auxiliary_loss_scale_max,
+        auxiliary_loss_coefficient_max=args.auxiliary_loss_coefficient_max,
         fast_global_safety_weight=args.fast_global_safety_weight,
         fast_role_specific_weight=args.fast_role_specific_weight,
         slow_global_safety_weight=args.slow_global_safety_weight,
         slow_role_specific_weight=args.slow_role_specific_weight,
+        health_actor_collapse_warning_abs_mean=args.health_actor_collapse_warning_abs_mean,
+        joint_freeze_manager_actor_episodes=args.joint_freeze_manager_actor_episodes,
+        joint_early_stop_patience_evaluations=args.joint_early_stop_patience_evaluations,
+        joint_early_stop_min_episodes=args.joint_early_stop_min_episodes,
+        inherit_stage_best_on_joint_transfer=not args.disable_joint_stage_best_inheritance,
         use_ess_action_guard=not args.disable_ess_action_guard,
         reachability_weight=args.reachability_weight,
         no_tensorboard=args.no_tensorboard, run_tests=args.run_tests,
