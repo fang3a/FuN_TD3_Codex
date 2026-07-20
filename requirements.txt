@@ -1,11 +1,15 @@
 numpy==1.23.5
 pandas==2.0.3
-scipy
-matplotlib
-networkx
-pandapower==2.14.10
+scipy==1.10.1
+matplotlib==3.7.2
+networkx==3.1
+pandapower==2.14.11
 pandapipes==0.10.0
-torch==1.12.1
-tensorboard
-protobuf<=3.20.3
-gymnasium
+# Validated Conda build: pytorch=1.12.1=py3.8_cuda11.3_cudnn8_0
+# CUDA runtime: cudatoolkit=11.3.1=h59b6b97_2
+--extra-index-url https://download.pytorch.org/whl/cu113
+torch==1.12.1+cu113
+tensorboard==2.10.0
+protobuf==3.19.6
+gymnasium==0.28.1
+pytest==8.3.5

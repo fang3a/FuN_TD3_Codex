@@ -67,7 +67,7 @@ MANAGER_INTERVAL = legacy.MANAGER_INTERVAL
 EPISODE_STEPS = legacy.EPISODE_STEPS
 GOAL_DIM = legacy.GOAL_DIM
 GOAL_PHYSICAL_SLICE = slice(24, 32)
-ALGORITHM_VERSION = "safety-smdp-td3-v11-guard-credit-calibrated"
+ALGORITHM_VERSION = "safety-smdp-td3-v12-terminal-safe-actor"
 
 ObservationBuilder = legacy.ObservationBuilder
 AgentBundle = legacy.AgentBundle
@@ -132,6 +132,9 @@ class TrainConfig(legacy.TrainConfig):
     projection_imitation_threshold: float = 1e-3
     projection_behavior_match_threshold: float = 0.05
     slow_guard_imitation_multiplier: float = 5.0
+    slow_projection_imitation_requires_behavior_match: bool = False
+    slow_action_boundary_weight: float = 0.05
+    slow_action_soft_limit: float = 0.90
 
     use_prioritized_replay: bool = True
     priority_alpha: float = 0.6
@@ -152,6 +155,8 @@ class TrainConfig(legacy.TrainConfig):
     manager_solver_priority_weight: float = 2.0
     slow_shaping_duration_mode: str = "terminal"
     priority_component_normalization: str = "running_scale"
+    priority_component_scale_floor: float = 1e-3
+    priority_component_clip: float = 5.0
     nonfinite_update_policy: str = "raise"
     full_resume_checkpoint_interval: int = 5
     strict_resume_required: bool = True
@@ -164,12 +169,13 @@ class TrainConfig(legacy.TrainConfig):
     strict_stage_sample_validation: bool = True
     debug_terminal_soc_penalty: bool = True
     reward_component_transform: str = "log1p_reference"
-    reward_scale_profile: str = "safety_calibrated_20260716_v2"
+    reward_scale_profile: str = "safety_calibrated_20260716_v3_terminal_dense"
     slow_role_specific_reward_scale: float = 25.0
     shaping_reference_floor: float = 1.0
-    adaptive_auxiliary_loss_scaling: bool = False
+    adaptive_auxiliary_loss_scaling: bool = True
     auxiliary_loss_scale_max: float = 1_000_000.0
-    auxiliary_loss_coefficient_max: float = 0.05
+    auxiliary_loss_coefficient_max: float = 50.0
+    auxiliary_loss_share_max: float = 0.10
     worker_component_clip_abs: float = 50.0
     fast_global_safety_weight: float = 0.50
     fast_role_specific_weight: float = 0.50
@@ -184,7 +190,7 @@ class TrainConfig(legacy.TrainConfig):
     # Joint fine-tuning starts from the transferred safety candidate.  Keeping the
     # Manager deterministic initially reduces simultaneous three-policy drift.
     inherit_stage_best_on_joint_transfer: bool = True
-    joint_freeze_manager_actor_episodes: int = 10
+    joint_freeze_manager_actor_episodes: int = 5
     joint_early_stop_patience_evaluations: int = 3
     joint_early_stop_min_episodes: int = 20
 
@@ -200,6 +206,10 @@ class TrainConfig(legacy.TrainConfig):
     min_power_success_rate: float = 0.999
     min_gas_success_rate: float = 0.999
     max_soc_violation_rate: float = 0.0
+    max_terminal_soc_violation_rate: float = 0.0
+    max_terminal_soc_deviation: float = 0.05
+    terminal_soc_dense_weight: float = 20.0
+    terminal_soc_dense_power: float = 4.0
     max_hard_constraint_violation_rate: float = 0.0
     max_voltage_rms_deviation_pu: float = 0.05
     max_gas_pressure_rms_deviation_bar: float = 0.5
@@ -295,7 +305,8 @@ class TrainConfig(legacy.TrainConfig):
         require("prioritized_sample_fraction", 0.0 <= self.prioritized_sample_fraction <= 1.0,
                 "0 <= prioritized_sample_fraction <= 1")
         for name in ("projection_imitation_weight", "projection_imitation_initial_weight",
-                     "projection_imitation_final_weight", "slow_guard_imitation_multiplier"):
+                     "projection_imitation_final_weight", "slow_guard_imitation_multiplier",
+                     "slow_action_boundary_weight"):
             require(name, np.isfinite(float(getattr(self, name))) and float(getattr(self, name)) >= 0.0,
                     f"{name} must be finite and >= 0")
         require("projection_imitation_decay_updates", int(self.projection_imitation_decay_updates) > 0,
@@ -313,10 +324,10 @@ class TrainConfig(legacy.TrainConfig):
                 f"reward_component_transform={self.reward_component_transform!r} must be "
                 "'none' or 'log1p_reference'"
             )
-        if self.reward_scale_profile != "safety_calibrated_20260716_v2":
+        if self.reward_scale_profile != "safety_calibrated_20260716_v3_terminal_dense":
             raise ValueError(
                 f"Unsupported reward_scale_profile={self.reward_scale_profile!r}; "
-                "expected 'safety_calibrated_20260716_v2'"
+                "expected 'safety_calibrated_20260716_v3_terminal_dense'"
             )
         require("shaping_reference_floor",
                 np.isfinite(self.shaping_reference_floor) and self.shaping_reference_floor > 0.0,
@@ -328,6 +339,21 @@ class TrainConfig(legacy.TrainConfig):
                 np.isfinite(self.auxiliary_loss_coefficient_max)
                 and self.auxiliary_loss_coefficient_max > 0.0,
                 "auxiliary_loss_coefficient_max must be finite and > 0")
+        require("auxiliary_loss_share_max",
+                np.isfinite(self.auxiliary_loss_share_max)
+                and 0.0 < self.auxiliary_loss_share_max <= 1.0,
+                "auxiliary_loss_share_max must be finite and in (0,1]")
+        require("slow_action_soft_limit",
+                np.isfinite(self.slow_action_soft_limit)
+                and 0.0 < self.slow_action_soft_limit < 1.0,
+                "slow_action_soft_limit must be finite and in (0,1)")
+        require("priority_component_scale_floor",
+                np.isfinite(self.priority_component_scale_floor)
+                and self.priority_component_scale_floor > 0.0,
+                "priority_component_scale_floor must be finite and > 0")
+        require("priority_component_clip",
+                np.isfinite(self.priority_component_clip) and self.priority_component_clip >= 1.0,
+                "priority_component_clip must be finite and >= 1")
         require("episode_steps", int(self.episode_steps) > 0, "episode_steps > 0")
         require("episode_steps", int(self.episode_steps) <= int(DEFAULT_CONFIG.time.steps_per_day),
                 f"episode_steps <= steps_per_day ({DEFAULT_CONFIG.time.steps_per_day}); cross-day episodes are unsupported")
@@ -454,13 +480,17 @@ class TrainConfig(legacy.TrainConfig):
         require("full_resume_checkpoint_interval", int(self.full_resume_checkpoint_interval) > 0,
                 "full_resume_checkpoint_interval > 0")
         for name in ("min_power_success_rate", "min_gas_success_rate", "max_soc_violation_rate",
-                     "max_hard_constraint_violation_rate"):
+                     "max_terminal_soc_violation_rate", "max_hard_constraint_violation_rate"):
             require(name, np.isfinite(float(getattr(self, name))) and 0.0 <= float(getattr(self, name)) <= 1.0,
                     f"{name} must be finite and in [0,1]")
         for name in ("max_voltage_rms_deviation_pu", "max_gas_pressure_rms_deviation_bar",
+                     "max_terminal_soc_deviation", "terminal_soc_dense_weight",
                      "metric_comparison_tolerance"):
             require(name, np.isfinite(float(getattr(self, name))) and float(getattr(self, name)) >= 0.0,
                     f"{name} must be finite and >= 0")
+        require("terminal_soc_dense_power",
+                np.isfinite(self.terminal_soc_dense_power) and self.terminal_soc_dense_power > 0.0,
+                "terminal_soc_dense_power must be finite and > 0")
         if self.reachability_weight > 0.0:
             raise ValueError(
                 "reachability_weight must remain 0 until a differentiable projection model is available: "
@@ -546,6 +576,18 @@ def validate_training_contract(cfg: TrainConfig) -> Dict[str, Dict[str, int]]:
         )
     existing, next_episode, _ = _resume_replay_sizes(cfg)
     remaining_episodes = max(int(cfg.episodes) - next_episode, 0)
+    if (
+        cfg.run_mode == "formal"
+        and cfg.training_stage == "joint_finetune"
+        and remaining_episodes > 0
+        and max(next_episode, int(cfg.joint_freeze_manager_actor_episodes)) >= int(cfg.episodes)
+    ):
+        raise ValueError(
+            "Formal joint fine-tuning must include Manager Actor updates: "
+            f"next_episode={next_episode}, episodes={cfg.episodes}, "
+            f"joint_freeze_manager_actor_episodes={cfg.joint_freeze_manager_actor_episodes}. "
+            "Reduce the freeze period or extend the run."
+        )
     expected_new = estimate_replay_samples(cfg, remaining_episodes)
     flags = legacy.stage_flags(cfg.training_stage)
     thresholds = {
@@ -608,7 +650,12 @@ def projection_imitation_weight(cfg: TrainConfig, update_step: int) -> float:
 
 def adaptive_auxiliary_weight(primary_loss: torch.Tensor, auxiliary_loss: torch.Tensor,
                               relative_weight: float, cfg: TrainConfig) -> float:
-    """Convert a desired relative actor-loss share into a detached coefficient."""
+    """Convert a desired Actor-loss share into a bounded detached coefficient.
+
+    The previous default disabled scaling, so a Q loss around 40--60 completely
+    dominated projection losses around 1e-2.  Scaling is based only on detached
+    magnitudes and caps both the requested share and the absolute coefficient.
+    """
 
     if relative_weight <= 0.0:
         return 0.0
@@ -616,8 +663,9 @@ def adaptive_auxiliary_weight(primary_loss: torch.Tensor, auxiliary_loss: torch.
         return float(relative_weight)
     primary = float(primary_loss.detach().abs().cpu())
     auxiliary = float(auxiliary_loss.detach().abs().cpu())
+    desired_share = min(float(relative_weight), float(cfg.auxiliary_loss_share_max))
     scale = primary / max(auxiliary, 1e-8)
-    coefficient = float(relative_weight * min(scale, cfg.auxiliary_loss_scale_max))
+    coefficient = float(desired_share * min(scale, cfg.auxiliary_loss_scale_max))
     # Without an absolute coefficient cap, an auxiliary loss approaching zero
     # produces an increasingly strong gradient despite a small loss contribution.
     # That feedback caused both Workers to collapse to normalized zero actions.
@@ -676,6 +724,21 @@ def worker_action_regularization_reference(
         require_finite_tensor("slow/action_regularization_reference", reference)
         return reference.clamp(-1.0, 1.0)
     raise ValueError(f"Unknown Worker role={role!r}")
+
+
+def slow_action_boundary_penalty(actions: torch.Tensor, soft_limit: float) -> torch.Tensor:
+    """Smoothly penalize normalized Slow requests that crowd the hard bounds.
+
+    This is an Actor-side safety regularizer, not an environment projection.  It
+    leaves the physical action range and all existing safety guards unchanged.
+    """
+
+    if actions.ndim != 2:
+        raise ValueError(f"Slow actions must be [batch, action_dim], got {tuple(actions.shape)}")
+    limit = float(soft_limit)
+    if not 0.0 < limit < 1.0:
+        raise ValueError(f"soft_limit={soft_limit!r} must be in (0,1)")
+    return torch.relu(actions.abs() - limit).pow(2).mean()
 
 
 def projection_imitation_masks(
@@ -893,6 +956,33 @@ def fixed_manager_goal() -> np.ndarray:
 # =============================================================================
 
 
+def terminal_soc_safety_state(env: Any, cfg: TrainConfig) -> Dict[str, float]:
+    """Return dense, time-aware terminal-SOC diagnostics without changing physics."""
+
+    initial = np.asarray([item.soc_initial for item in ESS_CONFIGS], dtype=np.float64)
+    current = np.asarray(getattr(env, "ess_soc", initial), dtype=np.float64)
+    if current.shape != initial.shape or not np.all(np.isfinite(current)):
+        raise FloatingPointError(
+            f"Invalid ESS SOC for terminal safety: shape={current.shape}, values={current!r}"
+        )
+    delta = np.abs(current - initial)
+    tolerance = float(cfg.max_terminal_soc_deviation)
+    excess = np.maximum(delta - tolerance, 0.0)
+    steps_per_day = max(int(env.config.time.steps_per_day), 1)
+    progress = float(np.clip(float(getattr(env, "current_step", 0)) / steps_per_day, 0.0, 1.0))
+    time_weight = progress ** float(cfg.terminal_soc_dense_power)
+    dense_cost = float(cfg.terminal_soc_dense_weight * time_weight * np.sum(np.square(excess)))
+    soc_span = max(float(max(item.soc_max - item.soc_min for item in ESS_CONFIGS)), 1e-6)
+    normalized_risk = float(np.clip(time_weight * np.max(excess) / soc_span, 0.0, 1.0))
+    return {
+        "progress": progress,
+        "dense_cost": dense_cost,
+        "max_deviation": float(np.max(delta)),
+        "rms_deviation": float(np.sqrt(np.mean(np.square(delta)))),
+        "normalized_risk": normalized_risk,
+    }
+
+
 def normalized_constraint_score(info: Mapping[str, Any], env: Any) -> float:
     """把多种安全指标归一到 ``[0,1]``，solver failure 只作为有界一项。"""
 
@@ -945,8 +1035,14 @@ def normalized_constraint_score(info: Mapping[str, Any], env: Any) -> float:
         value("soc_max", 0.5) - max(item.soc_max for item in ESS_CONFIGS),
         0.0,
     ) / 0.10
+    terminal_soc = 0.0
+    if _ACTIVE_CONFIG is not None:
+        terminal_soc = terminal_soc_safety_state(env, _ACTIVE_CONFIG)["normalized_risk"]
     solver = float(bool(info.get("solver_failed", False)))
-    terms = np.clip(np.asarray([voltage, pressure, line, pipe, source, soc, solver]), 0.0, 1.0)
+    terms = np.clip(
+        np.asarray([voltage, pressure, line, pipe, source, soc, terminal_soc, solver]),
+        0.0, 1.0,
+    )
     score = float(np.clip(0.5 * np.max(terms) + 0.5 * np.mean(terms), 0.0, 1.0))
     if solver > 0.0:
         score = 1.0
@@ -1018,11 +1114,23 @@ class _PrioritizedReplayMixin:
         valid = np.nan_to_num(np.asarray(values[:valid_size], dtype=np.float64), nan=0.0,
                               posinf=self.cfg.max_replay_priority, neginf=0.0)
         if mode == "running_scale":
-            observed_scale = max(float(np.percentile(np.abs(valid), 90)), self.cfg.priority_epsilon)
+            absolute = np.abs(valid)
+            positive = absolute[absolute > self.cfg.priority_epsilon]
+            # Hard violations are intentionally sparse.  Using the percentile of
+            # all samples made the 90th percentile exactly zero and divided rare
+            # violations by epsilon, producing priorities above 1e4.  Normalize
+            # against the positive population and cap each component instead.
+            observed_scale = (
+                float(np.percentile(positive, 90)) if positive.size else
+                float(self.priority_running_scales.get(component, 1.0))
+            )
+            observed_scale = max(observed_scale, float(self.cfg.priority_component_scale_floor))
             old_scale = float(self.priority_running_scales.get(component, 1.0))
             scale = 0.99 * old_scale + 0.01 * observed_scale
+            scale = max(scale, float(self.cfg.priority_component_scale_floor))
             self.priority_running_scales[component] = scale
-            return selected / max(scale, self.cfg.priority_epsilon)
+            normalized = selected / scale
+            return np.clip(normalized, 0.0, float(self.cfg.priority_component_clip))
         order = np.argsort(np.argsort(valid, kind="stable"), kind="stable").astype(np.float64)
         ranks = (order + 1.0) / max(float(valid_size), 1.0)
         return ranks[indices]
@@ -1765,8 +1873,19 @@ class PendingSlowSegment:
 
 def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: np.ndarray):
     global _LAST_CONSTRAINT_SCORE
-    result = _LEGACY_SAFE_ENV_STEP(env, action, last_obs)
-    info = result[4]
+    next_obs, reward, terminated, truncated, info = _LEGACY_SAFE_ENV_STEP(env, action, last_obs)
+    if _ACTIVE_CONFIG is not None and not bool(info.get("solver_failed", False)):
+        terminal_state = terminal_soc_safety_state(env, _ACTIVE_CONFIG)
+        dense_cost = float(terminal_state["dense_cost"])
+        components = info.setdefault("reward_components", {})
+        components["terminal_soc_dense"] = float(
+            components.get("terminal_soc_dense", 0.0)
+        ) + dense_cost
+        metrics = info.setdefault("constraint_metrics", {})
+        metrics["terminal_soc_max_deviation"] = terminal_state["max_deviation"]
+        metrics["terminal_soc_rms_deviation"] = terminal_state["rms_deviation"]
+        metrics["terminal_soc_normalized_risk"] = terminal_state["normalized_risk"]
+        reward = float(reward) - dense_cost
     _LAST_CONSTRAINT_SCORE = normalized_constraint_score(info, env)
     info["_normalized_constraint_score"] = _LAST_CONSTRAINT_SCORE
     if _CURRENT_SLOW_PENDING is not None:
@@ -1780,7 +1899,7 @@ def safe_env_step(env: ElectricGasMultiScaleEnv, action: np.ndarray, last_obs: n
                 applied[:env.slow_action_dim],
                 float(_ACTIVE_CONFIG.gamma_fast if _ACTIVE_CONFIG is not None else 0.99),
             )
-    return result
+    return next_obs, reward, terminated, truncated, info
 
 
 def apply_ess_action_guard(env: ElectricGasMultiScaleEnv, slow_action: np.ndarray,
@@ -2417,6 +2536,9 @@ class WorkerTD3(legacy.WorkerTD3):
         imitation_contribution_ratio = 0.0
         action_regularization_effective_weight = 0.0
         action_regularization_contribution_ratio = 0.0
+        slow_boundary_loss_value = 0.0
+        slow_boundary_effective_weight = 0.0
+        slow_boundary_contribution_ratio = 0.0
         actor_saturation_ratio = 0.0
         actor_action_abs_mean = 0.0
         actor_reference_deviation_rms = 0.0
@@ -2467,6 +2589,22 @@ class WorkerTD3(legacy.WorkerTD3):
                         policy_loss.detach().abs().clamp_min(1e-8)
                     ).cpu()
                 )
+                if self.role == "slow" and self.cfg.slow_action_boundary_weight > 0.0:
+                    boundary_loss = slow_action_boundary_penalty(
+                        actor_raw_actions, self.cfg.slow_action_soft_limit
+                    )
+                    slow_boundary_effective_weight = adaptive_auxiliary_weight(
+                        policy_loss, boundary_loss,
+                        self.cfg.slow_action_boundary_weight, self.cfg,
+                    )
+                    boundary_contribution = slow_boundary_effective_weight * boundary_loss
+                    actor_loss = actor_loss + boundary_contribution
+                    slow_boundary_loss_value = float(boundary_loss.detach().cpu())
+                    slow_boundary_contribution_ratio = float(
+                        boundary_contribution.detach().abs().div(
+                            policy_loss.detach().abs().clamp_min(1e-8)
+                        ).cpu()
+                    )
                 projected_elements, behavior_match_mask, imitation_elements = (
                     projection_imitation_element_mask(
                         actor_raw_actions, actor_historical_raw, actor_imitation_actions,
@@ -2474,6 +2612,11 @@ class WorkerTD3(legacy.WorkerTD3):
                         self.cfg.projection_behavior_match_threshold,
                     )
                 )
+                if (
+                    self.role == "slow"
+                    and not self.cfg.slow_projection_imitation_requires_behavior_match
+                ):
+                    imitation_elements = projected_elements
                 projection_mask_ratio = float(
                     projected_elements.float().mean().detach().cpu()
                 )
@@ -2541,6 +2684,9 @@ class WorkerTD3(legacy.WorkerTD3):
             prefix + "projection_imitation_contribution_ratio": imitation_contribution_ratio,
             prefix + "action_regularization_effective_weight": action_regularization_effective_weight,
             prefix + "action_regularization_contribution_ratio": action_regularization_contribution_ratio,
+            prefix + "slow_boundary_loss": slow_boundary_loss_value,
+            prefix + "slow_boundary_effective_weight": slow_boundary_effective_weight,
+            prefix + "slow_boundary_contribution_ratio": slow_boundary_contribution_ratio,
             prefix + "sample_projection_mse": float((raw_actions - executed_actions).pow(2).mean().detach().cpu()),
             prefix + "raw_to_guarded_projection_mse": float(
                 (raw_actions - imitation_actions).pow(2).mean().detach().cpu()
@@ -2964,10 +3110,13 @@ def _critical_optimization_config(cfg: TrainConfig) -> Dict[str, Any]:
         "slow_role_specific_reward_scale", "slow_guard_imitation_multiplier",
         "use_prioritized_replay", "priority_alpha", "constraint_priority_weight",
         "projection_priority_weight", "projection_behavior_match_threshold",
+        "slow_projection_imitation_requires_behavior_match",
+        "slow_action_boundary_weight", "slow_action_soft_limit",
         "fast_priority_beta_anneal_updates", "slow_priority_beta_anneal_updates",
         "manager_priority_beta_anneal_updates", "prioritized_sample_fraction",
         "manager_use_prioritized_replay", "slow_shaping_duration_mode",
-        "priority_component_normalization", "nonfinite_update_policy",
+        "priority_component_normalization", "priority_component_scale_floor",
+        "priority_component_clip", "nonfinite_update_policy",
         "eval_seed_mode", "best_model_metric", "save_replay_in_checkpoint",
         "bootstrap_on_time_limit", "unexpected_env_exception_policy",
         "fast_random_warmup_steps", "slow_random_warmup_segments",
@@ -2978,6 +3127,10 @@ def _critical_optimization_config(cfg: TrainConfig) -> Dict[str, Any]:
         "joint_policy_frequency", "joint_freeze_manager_actor_episodes",
         "inherit_stage_best_on_joint_transfer",
         "joint_early_stop_patience_evaluations", "joint_early_stop_min_episodes",
+        "adaptive_auxiliary_loss_scaling", "auxiliary_loss_coefficient_max",
+        "auxiliary_loss_share_max", "max_terminal_soc_violation_rate",
+        "max_terminal_soc_deviation", "terminal_soc_dense_weight",
+        "terminal_soc_dense_power",
     )
     return {name: getattr(cfg, name) for name in names}
 
@@ -3437,6 +3590,15 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1,
         "gas_solver_success_rate": float(sum(item["gas_solver_success_rate"] * item["steps"] for item in results) / max(total_steps, 1.0)),
         "soc_violation_rate": float(sum(item.get("soc_violation_rate", 0.0) * item["steps"]
                                           for item in results) / max(total_steps, 1.0)),
+        "terminal_soc_violation_rate": float(np.mean([
+            item.get("terminal_soc_violation_rate", 1.0) for item in results
+        ])),
+        "max_terminal_soc_deviation": float(max(
+            item.get("max_terminal_soc_deviation", float("inf")) for item in results
+        )),
+        "mean_terminal_soc_rms_deviation": float(np.mean([
+            item.get("mean_terminal_soc_rms_deviation", float("inf")) for item in results
+        ])),
         "mean_voltage_rms_deviation_pu": float(np.mean([item["mean_voltage_rms_deviation_pu"] for item in results])),
         "mean_gas_pressure_rms_deviation_bar": float(np.mean([item["mean_gas_pressure_rms_deviation_bar"] for item in results])),
     }
@@ -3459,8 +3621,13 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1,
     for key in list(aggregate):
         if key.endswith("_cost_total"):
             aggregate[key[:-len("_cost_total")] + "_cost_per_step"] = (
-                aggregate[key] / max(total_steps, 1.0)
+            aggregate[key] / max(total_steps, 1.0)
             )
+    # Preserve the episode-level terminal-SOC contract after generic suffix
+    # aggregation, which otherwise treats it like a per-fast-step rate.
+    aggregate["terminal_soc_violation_rate"] = float(np.mean([
+        item.get("terminal_soc_violation_rate", 1.0) for item in results
+    ]))
     feasible, feasibility_reasons = legacy.is_feasible(aggregate, cfg)
     aggregate["constraint_feasibility"] = float(feasible)
     aggregate["feasibility_reasons"] = feasibility_reasons
@@ -3705,7 +3872,13 @@ def _test_reward_scale_calibration() -> None:
     primary = torch.tensor(100.0)
     auxiliary = torch.tensor(2.0)
     coefficient = adaptive_auxiliary_weight(primary, auxiliary, 0.10, cfg)
-    assert math.isclose(coefficient, 0.10, rel_tol=1e-6)
+    assert math.isclose(coefficient, 5.0, rel_tol=1e-6)
+    fixed_cfg = copy.deepcopy(cfg)
+    fixed_cfg.adaptive_auxiliary_loss_scaling = False
+    assert math.isclose(
+        adaptive_auxiliary_weight(primary, auxiliary, 0.10, fixed_cfg),
+        0.10, rel_tol=1e-6,
+    )
     adaptive_cfg = copy.deepcopy(cfg)
     adaptive_cfg.adaptive_auxiliary_loss_scaling = True
     adaptive_cfg.auxiliary_loss_coefficient_max = 0.05
@@ -4013,6 +4186,8 @@ def _test_feasibility_thresholds() -> None:
         "power_solver_success_rate": 1.0,
         "gas_solver_success_rate": 1.0,
         "soc_violation_rate": 0.0,
+        "terminal_soc_violation_rate": 0.0,
+        "max_terminal_soc_deviation": 0.0,
         "voltage_violation_rate": 0.0,
         "gas_pressure_violation_rate": 0.0,
         "line_overload_rate": 0.0,
@@ -4214,6 +4389,15 @@ def _test_cli_contract() -> None:
         ("constraint_priority_weight", -1.0), ("projection_priority_weight", -1.0),
         ("projection_imitation_initial_weight", -0.1),
         ("slow_guard_imitation_multiplier", -0.1),
+        ("slow_action_boundary_weight", -0.1),
+        ("slow_action_soft_limit", 1.0),
+        ("priority_component_scale_floor", 0.0),
+        ("priority_component_clip", 0.5),
+        ("auxiliary_loss_share_max", 0.0),
+        ("max_terminal_soc_violation_rate", 1.1),
+        ("max_terminal_soc_deviation", -0.1),
+        ("terminal_soc_dense_weight", -1.0),
+        ("terminal_soc_dense_power", 0.0),
         ("projection_imitation_decay_updates", 0), ("fast_buffer_size", 0),
         ("fast_batch_size", 0), ("eval_interval", 0), ("eval_episodes", 0),
         ("worker_reward_clip_abs", -1.0), ("target_q_clip_abs", -1.0),
@@ -4253,6 +4437,60 @@ def _test_constraint_score_robustness() -> None:
     assert np.isfinite(score) and 0.0 <= score <= 1.0
     failed_score = normalized_constraint_score({"solver_failed": True, "constraint_metrics": {}}, env)
     assert failed_score == 1.0
+
+
+def _test_terminal_soc_and_actor_safety_contract() -> None:
+    class FakeEnv:
+        config = DEFAULT_CONFIG
+        current_step = 0
+        ess_soc = np.asarray([item.soc_initial for item in ESS_CONFIGS], dtype=float)
+
+    cfg = TrainConfig(run_mode="debug")
+    env = FakeEnv()
+    safe = terminal_soc_safety_state(env, cfg)
+    assert safe["dense_cost"] == 0.0 and safe["max_deviation"] == 0.0
+    env.ess_soc = np.asarray([item.soc_initial - 0.20 for item in ESS_CONFIGS], dtype=float)
+    env.current_step = DEFAULT_CONFIG.time.steps_per_day
+    unsafe = terminal_soc_safety_state(env, cfg)
+    assert unsafe["dense_cost"] > 0.0 and unsafe["normalized_risk"] > 0.0
+
+    actions = torch.tensor([[0.0, 0.90, 0.95, -1.0]], dtype=torch.float32)
+    boundary = slow_action_boundary_penalty(actions, 0.90)
+    expected = (0.0 + 0.0 + 0.05 ** 2 + 0.10 ** 2) / 4.0
+    assert math.isclose(float(boundary), expected, rel_tol=1e-5)
+    primary = torch.tensor(40.0)
+    auxiliary = torch.tensor(0.1)
+    coefficient = adaptive_auxiliary_weight(primary, auxiliary, 0.05, cfg)
+    assert math.isclose(coefficient * float(auxiliary), 2.0, rel_tol=1e-6)
+
+    formal = TrainConfig(
+        run_mode="formal", training_stage="joint_finetune", episodes=5,
+        episode_steps=DEFAULT_CONFIG.time.steps_per_day,
+        joint_freeze_manager_actor_episodes=5,
+    )
+    try:
+        validate_training_contract(formal)
+    except ValueError as exc:
+        assert "Manager Actor updates" in str(exc)
+    else:
+        raise AssertionError("Formal joint training may not freeze Manager Actor for the whole run")
+
+
+def _test_sparse_per_normalization_is_bounded(device: torch.device) -> None:
+    cfg = TrainConfig(
+        run_mode="debug", priority_component_normalization="running_scale",
+        priority_component_scale_floor=1e-3, priority_component_clip=5.0,
+    )
+    buffer = FastReplayBuffer(128, 2, 2, GOAL_DIM, device, cfg)
+    buffer.idx = 101
+    buffer.constraint_scores[:101] = 0.0
+    buffer.constraint_scores[100] = 0.1
+    normalized = buffer._normalized_priority_component(
+        buffer.constraint_scores, np.arange(101), "constraint"
+    )
+    assert np.all(np.isfinite(normalized))
+    assert float(np.max(normalized)) <= cfg.priority_component_clip
+    assert buffer.priority_running_scales["constraint"] >= cfg.priority_component_scale_floor
 
 
 def _test_per_initialization_and_sampling(device: torch.device) -> None:
@@ -4585,8 +4823,10 @@ def _synthetic_evaluation_stats(mean_return: float = 0.0,
     for name in (
         "voltage_violation_rate", "gas_pressure_violation_rate", "line_overload_rate",
         "pipe_velocity_violation_rate", "source_capacity_violation_rate", "soc_violation_rate",
+        "terminal_soc_violation_rate",
         "max_voltage_violation", "max_pressure_violation", "max_line_overload",
         "max_pipe_velocity_violation", "max_source_capacity_violation",
+        "max_terminal_soc_deviation",
         "voltage_violation_cost_per_step", "gas_pressure_violation_cost_per_step",
         "line_overload_cost_per_step", "pipe_velocity_violation_cost_per_step",
         "source_capacity_violation_cost_per_step",
@@ -5267,6 +5507,8 @@ def run_minimum_tests() -> None:
     _test_time_scale_validation()
     _test_cli_contract()
     _test_constraint_score_robustness()
+    _test_terminal_soc_and_actor_safety_contract()
+    _test_sparse_per_normalization_is_bounded(device)
     _test_per_initialization_and_sampling(device)
     _test_mixed_per_monte_carlo(device)
     _test_raw_critic_executed_transition_and_per(device)
@@ -5335,6 +5577,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--projection-imitation-threshold", type=float, default=1e-3)
     parser.add_argument("--projection-behavior-match-threshold", type=float, default=0.05)
     parser.add_argument("--slow-guard-imitation-multiplier", type=float, default=5.0)
+    parser.add_argument("--slow-projection-imitation-requires-behavior-match", action="store_true")
+    parser.add_argument("--slow-action-boundary-weight", type=float, default=0.05)
+    parser.add_argument("--slow-action-soft-limit", type=float, default=0.90)
     parser.add_argument("--projection-imitation-weight", type=float)
     parser.add_argument("--disable-prioritized-replay", action="store_true")
     parser.add_argument("--priority-alpha", type=float, default=0.6)
@@ -5354,6 +5599,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--manager-solver-priority-weight", type=float, default=2.0)
     parser.add_argument("--priority-component-normalization",
                         choices=("none", "running_scale", "rank"), default="running_scale")
+    parser.add_argument("--priority-component-scale-floor", type=float, default=1e-3)
+    parser.add_argument("--priority-component-clip", type=float, default=5.0)
     parser.add_argument("--slow-shaping-duration-mode", choices=("terminal", "normalized"), default="terminal")
     parser.add_argument("--fast-pretrain-episodes", type=int, default=50)
     parser.add_argument("--slow-pretrain-episodes", type=int, default=50)
@@ -5373,6 +5620,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
     parser.add_argument("--min-power-success-rate", type=float, default=0.999)
     parser.add_argument("--min-gas-success-rate", type=float, default=0.999)
     parser.add_argument("--max-soc-violation-rate", type=float, default=0.0)
+    parser.add_argument("--max-terminal-soc-violation-rate", type=float, default=0.0)
+    parser.add_argument("--max-terminal-soc-deviation", type=float, default=0.05)
+    parser.add_argument("--terminal-soc-dense-weight", type=float, default=20.0)
+    parser.add_argument("--terminal-soc-dense-power", type=float, default=4.0)
     parser.add_argument("--max-voltage-rms-deviation-pu", type=float, default=0.05)
     parser.add_argument("--max-gas-pressure-rms-deviation-bar", type=float, default=0.5)
     parser.add_argument("--metric-comparison-tolerance", type=float, default=1e-6)
@@ -5406,11 +5657,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
                         help="Per-component cap after reference normalization")
     parser.add_argument("--reward-component-transform", choices=("none", "log1p_reference"),
                         default="log1p_reference")
-    parser.add_argument("--reward-scale-profile", default="safety_calibrated_20260716_v2")
+    parser.add_argument(
+        "--reward-scale-profile", default="safety_calibrated_20260716_v3_terminal_dense"
+    )
     parser.add_argument("--slow-role-specific-reward-scale", type=float, default=25.0)
     parser.add_argument("--shaping-reference-floor", type=float, default=1.0)
     parser.add_argument("--auxiliary-loss-scale-max", type=float, default=1_000_000.0)
-    parser.add_argument("--auxiliary-loss-coefficient-max", type=float, default=0.05)
+    parser.add_argument("--auxiliary-loss-coefficient-max", type=float, default=50.0)
+    parser.add_argument("--auxiliary-loss-share-max", type=float, default=0.10)
     auxiliary_group = parser.add_mutually_exclusive_group()
     auxiliary_group.add_argument(
         "--enable-adaptive-auxiliary-loss-scaling",
@@ -5422,9 +5676,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         dest="adaptive_auxiliary_loss_scaling",
         action="store_false",
     )
-    parser.set_defaults(adaptive_auxiliary_loss_scaling=False)
+    parser.set_defaults(adaptive_auxiliary_loss_scaling=True)
     parser.add_argument("--health-actor-collapse-warning-abs-mean", type=float, default=0.03)
-    parser.add_argument("--joint-freeze-manager-actor-episodes", type=int, default=10)
+    parser.add_argument("--joint-freeze-manager-actor-episodes", type=int, default=5)
     parser.add_argument("--joint-early-stop-patience-evaluations", type=int, default=3)
     parser.add_argument("--joint-early-stop-min-episodes", type=int, default=20)
     parser.add_argument("--disable-joint-stage-best-inheritance", action="store_true")
@@ -5490,6 +5744,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         projection_imitation_threshold=args.projection_imitation_threshold,
         projection_behavior_match_threshold=args.projection_behavior_match_threshold,
         slow_guard_imitation_multiplier=args.slow_guard_imitation_multiplier,
+        slow_projection_imitation_requires_behavior_match=(
+            args.slow_projection_imitation_requires_behavior_match
+        ),
+        slow_action_boundary_weight=args.slow_action_boundary_weight,
+        slow_action_soft_limit=args.slow_action_soft_limit,
         use_prioritized_replay=not args.disable_prioritized_replay,
         priority_alpha=args.priority_alpha, priority_beta_initial=args.priority_beta_initial,
         priority_beta_final=args.priority_beta_final,
@@ -5506,6 +5765,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         manager_constraint_priority_weight=args.manager_constraint_priority_weight,
         manager_solver_priority_weight=args.manager_solver_priority_weight,
         priority_component_normalization=args.priority_component_normalization,
+        priority_component_scale_floor=args.priority_component_scale_floor,
+        priority_component_clip=args.priority_component_clip,
         slow_shaping_duration_mode=args.slow_shaping_duration_mode,
         fast_pretrain_episodes=args.fast_pretrain_episodes,
         slow_pretrain_episodes=args.slow_pretrain_episodes,
@@ -5520,6 +5781,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         min_power_success_rate=args.min_power_success_rate,
         min_gas_success_rate=args.min_gas_success_rate,
         max_soc_violation_rate=args.max_soc_violation_rate,
+        max_terminal_soc_violation_rate=args.max_terminal_soc_violation_rate,
+        max_terminal_soc_deviation=args.max_terminal_soc_deviation,
+        terminal_soc_dense_weight=args.terminal_soc_dense_weight,
+        terminal_soc_dense_power=args.terminal_soc_dense_power,
         max_voltage_rms_deviation_pu=args.max_voltage_rms_deviation_pu,
         max_gas_pressure_rms_deviation_bar=args.max_gas_pressure_rms_deviation_bar,
         metric_comparison_tolerance=args.metric_comparison_tolerance,
@@ -5554,6 +5819,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> TrainConfig:
         adaptive_auxiliary_loss_scaling=args.adaptive_auxiliary_loss_scaling,
         auxiliary_loss_scale_max=args.auxiliary_loss_scale_max,
         auxiliary_loss_coefficient_max=args.auxiliary_loss_coefficient_max,
+        auxiliary_loss_share_max=args.auxiliary_loss_share_max,
         fast_global_safety_weight=args.fast_global_safety_weight,
         fast_role_specific_weight=args.fast_role_specific_weight,
         slow_global_safety_weight=args.slow_global_safety_weight,

@@ -183,7 +183,7 @@ class TrainConfig:
     # not distance to normalized zero (zero means 25% curtailment for renewables).
     worker_action_l2_weight: float = 0.002
     reward_component_transform: str = "log1p_reference"
-    reward_scale_profile: str = "safety_calibrated_20260716_v2"
+    reward_scale_profile: str = "safety_calibrated_20260716_v3_terminal_dense"
     # Fixed from the 2026-07-15 Replay diagnosis: with nominal 0.5/0.5
     # weights Slow role credit contributed only 0.96% of the absolute reward.
     # A fixed multiplier preserves stationarity and targets roughly a 80/20
@@ -495,6 +495,7 @@ class EpisodeCSVLogger:
             "eval_power_success_rate", "eval_gas_success_rate",
             "eval_mean_voltage_rms_deviation_pu",
             "eval_mean_gas_pressure_rms_deviation_bar",
+            "eval_terminal_soc_violation_rate", "eval_max_terminal_soc_deviation",
             "fast_buffer_size", "slow_buffer_size", "manager_buffer_size",
             "solver_failures", "gas_solve_count", "mean_action_projection",
             "max_action_projection", "mean_slow_action_projection",
@@ -505,7 +506,8 @@ class EpisodeCSVLogger:
             "voltage_deviation_cost", "gas_pressure_deviation_cost",
             "voltage_violation_cost", "gas_pressure_violation_cost",
             "pipe_velocity_violation_cost", "source_capacity_violation_cost",
-            "gas_purchase_cost",
+            "gas_purchase_cost", "terminal_soc_cost", "terminal_soc_dense_cost",
+            "terminal_soc_max_deviation", "terminal_soc_rms_deviation",
             "interaction_reward_estimated_clips", "manager_reward_clips",
             "fast_total_insertions", "slow_total_insertions", "manager_total_insertions",
             "fast_update_count", "slow_update_count", "manager_update_count",
@@ -1539,7 +1541,8 @@ def build_agents(env: ElectricGasMultiScaleEnv, cfg: TrainConfig, device: torch.
 
 GLOBAL_SAFETY_COMPONENTS = (
     "voltage_deviation", "voltage_violation", "line_overload",
-    "soc_soft", "terminal_soc", "gas_pressure_deviation", "gas_pressure_violation",
+    "soc_soft", "terminal_soc", "terminal_soc_dense",
+    "gas_pressure_deviation", "gas_pressure_violation",
     "pipe_velocity_violation", "source_capacity_violation", "solver_failure",
 )
 # Role-specific groups are deliberately disjoint from GLOBAL_SAFETY_COMPONENTS.
@@ -1562,6 +1565,7 @@ SAFETY_COMPONENT_REFERENCE_COSTS: Dict[str, float] = {
     "line_overload": 10.0,
     "soc_soft": 0.10,
     "terminal_soc": 10.0,
+    "terminal_soc_dense": 1.0,
     "gas_pressure_deviation": 5.0,
     "gas_pressure_violation": 25.0,
     "pipe_velocity_violation": 10.0,
@@ -1581,6 +1585,7 @@ SAFETY_COMPONENT_IMPORTANCE: Dict[str, float] = {
     "line_overload": 10.0,
     "soc_soft": 2.0,
     "terminal_soc": 5.0,
+    "terminal_soc_dense": 5.0,
     "gas_pressure_deviation": 1.0,
     "gas_pressure_violation": 10.0,
     "pipe_velocity_violation": 10.0,
@@ -1993,6 +1998,12 @@ def is_feasible(metrics: Mapping[str, Any], cfg: TrainConfig) -> Tuple[bool, Lis
         ("power_solver_success_rate", ">=", float(getattr(cfg, "min_power_success_rate", 0.999))),
         ("gas_solver_success_rate", ">=", float(getattr(cfg, "min_gas_success_rate", 0.999))),
         ("soc_violation_rate", "<=", float(getattr(cfg, "max_soc_violation_rate", 0.0))),
+        ("terminal_soc_violation_rate", "<=", float(
+            getattr(cfg, "max_terminal_soc_violation_rate", 0.0)
+        )),
+        ("max_terminal_soc_deviation", "<=", float(
+            getattr(cfg, "max_terminal_soc_deviation", 0.05)
+        )),
         ("voltage_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
         ("gas_pressure_violation_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
         ("line_overload_rate", "<=", float(getattr(cfg, "max_hard_constraint_violation_rate", 0.0))),
@@ -2031,10 +2042,12 @@ def build_evaluation_metric_state(stats: Mapping[str, Any], cfg: TrainConfig) ->
     rate_names = (
         "voltage_violation_rate", "gas_pressure_violation_rate", "line_overload_rate",
         "pipe_velocity_violation_rate", "source_capacity_violation_rate", "soc_violation_rate",
+        "terminal_soc_violation_rate",
     )
     maximum_names = (
         "max_voltage_violation", "max_pressure_violation", "max_line_overload",
         "max_pipe_velocity_violation", "max_source_capacity_violation",
+        "max_terminal_soc_deviation",
     )
     cost_names = (
         "voltage_violation_cost_per_step", "gas_pressure_violation_cost_per_step",
@@ -3083,6 +3096,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         fast_curtailment_action_mean = mean_training_metric(
             "fast_curtailment_action_mean", "fast"
         )
+        terminal_soc_delta = np.asarray(env.ess_soc, dtype=float) - np.asarray(
+            [item.soc_initial for item in ESS_CONFIGS], dtype=float
+        )
+        terminal_soc_max_deviation = float(np.max(np.abs(terminal_soc_delta)))
+        terminal_soc_rms_deviation = float(np.sqrt(np.mean(np.square(terminal_soc_delta))))
         writer.add_scalar("health/nonfinite_batch_count", nonfinite_batch_count, episode)
         for role, count in update_deltas.items():
             writer.add_scalar(f"health/{role}_updates_this_episode", count, episode)
@@ -3223,6 +3241,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         writer.add_scalar("episode/interaction_reward_estimated_clips",
                           interaction_reward_estimated_clips, episode)
         writer.add_scalar("episode/manager_reward_clips", manager_reward_clips, episode)
+        writer.add_scalar(
+            "episode/terminal_soc_max_deviation", terminal_soc_max_deviation, episode
+        )
+        writer.add_scalar(
+            "episode/terminal_soc_rms_deviation", terminal_soc_rms_deviation, episode
+        )
+        writer.add_scalar(
+            "episode/terminal_soc_dense_cost",
+            component_totals.get("terminal_soc_dense", 0.0), episode,
+        )
         LOGGER.info("Episode %s return %.3f | buffers fast=%s slow=%s manager=%s | failures=%s",
                     episode, episode_return, len(fast_buffer), len(slow_buffer), len(manager_buffer),
                     solver_failures)
@@ -3233,6 +3261,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
         eval_gas_success_rate: Any = ""
         eval_mean_voltage_rms: Any = ""
         eval_mean_gas_pressure_rms: Any = ""
+        eval_terminal_soc_violation_rate: Any = ""
+        eval_max_terminal_soc_deviation: Any = ""
         early_stop_requested = False
         if (episode + 1) % max(1, cfg.eval_interval) == 0 or episode == cfg.episodes - 1:
             eval_stats = evaluate_policy(agents, cfg, episodes=cfg.eval_episodes, max_steps=cfg.episode_steps,
@@ -3243,6 +3273,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             eval_gas_success_rate = eval_stats["gas_success_rate"]
             eval_mean_voltage_rms = eval_stats["mean_voltage_rms_deviation_pu"]
             eval_mean_gas_pressure_rms = eval_stats["mean_gas_pressure_rms_deviation_bar"]
+            eval_terminal_soc_violation_rate = eval_stats["terminal_soc_violation_rate"]
+            eval_max_terminal_soc_deviation = eval_stats["max_terminal_soc_deviation"]
             writer.add_scalar("eval/return", eval_stats["mean_return"], episode)
             writer.add_scalar("eval/solver_failures", eval_stats["solver_failures"], episode)
             writer.add_scalar("eval/power_success_rate", eval_stats["power_success_rate"], episode)
@@ -3251,6 +3283,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
                               eval_stats["mean_voltage_rms_deviation_pu"], episode)
             writer.add_scalar("eval/mean_gas_pressure_rms_deviation_bar",
                               eval_stats["mean_gas_pressure_rms_deviation_bar"], episode)
+            writer.add_scalar(
+                "eval/terminal_soc_violation_rate",
+                eval_stats["terminal_soc_violation_rate"], episode,
+            )
+            writer.add_scalar(
+                "eval/max_terminal_soc_deviation",
+                eval_stats["max_terminal_soc_deviation"], episode,
+            )
             evaluation_improved = is_better_evaluation(eval_stats, best_metric_state, cfg)
             if evaluation_improved:
                 best_eval_return = eval_stats["mean_return"]
@@ -3302,6 +3342,8 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             "eval_gas_success_rate": eval_gas_success_rate,
             "eval_mean_voltage_rms_deviation_pu": eval_mean_voltage_rms,
             "eval_mean_gas_pressure_rms_deviation_bar": eval_mean_gas_pressure_rms,
+            "eval_terminal_soc_violation_rate": eval_terminal_soc_violation_rate,
+            "eval_max_terminal_soc_deviation": eval_max_terminal_soc_deviation,
             "fast_buffer_size": len(fast_buffer),
             "slow_buffer_size": len(slow_buffer),
             "manager_buffer_size": len(manager_buffer),
@@ -3326,6 +3368,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, Any]:
             "pipe_velocity_violation_cost": component_totals.get("pipe_velocity_violation", 0.0),
             "source_capacity_violation_cost": component_totals.get("source_capacity_violation", 0.0),
             "gas_purchase_cost": component_totals.get("gas_purchase", 0.0),
+            "terminal_soc_cost": component_totals.get("terminal_soc", 0.0),
+            "terminal_soc_dense_cost": component_totals.get("terminal_soc_dense", 0.0),
+            "terminal_soc_max_deviation": terminal_soc_max_deviation,
+            "terminal_soc_rms_deviation": terminal_soc_rms_deviation,
             "interaction_reward_estimated_clips": interaction_reward_estimated_clips,
             "manager_reward_clips": manager_reward_clips,
             "fast_total_insertions": fast_buffer.total_insertions,
@@ -3500,6 +3546,8 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
     }
     voltage_rms_deviations: List[float] = []
     gas_pressure_rms_deviations: List[float] = []
+    terminal_soc_max_deviations: List[float] = []
+    terminal_soc_rms_deviations: List[float] = []
     try:
         for ep in range(episodes):
             global_obs, _ = env.reset(seed=seed + ep)
@@ -3609,6 +3657,10 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
                 step_count += 1
                 if terminated or truncated:
                     break
+            initial_soc = np.asarray([item.soc_initial for item in ESS_CONFIGS], dtype=float)
+            terminal_delta = np.asarray(env.ess_soc, dtype=float) - initial_soc
+            terminal_soc_max_deviations.append(float(np.max(np.abs(terminal_delta))))
+            terminal_soc_rms_deviations.append(float(np.sqrt(np.mean(np.square(terminal_delta)))))
             returns.append(ep_return)
     finally:
         if previous_modes[0]:
@@ -3627,6 +3679,13 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
         "power_solver_success_rate": float(power_ok / denom),
         "gas_solver_success_rate": float(gas_ok / denom),
         "soc_violation_rate": float(soc_violation_steps / denom),
+        "terminal_soc_violation_rate": float(np.mean(
+            np.asarray(terminal_soc_max_deviations, dtype=float)
+            > float(getattr(cfg, "max_terminal_soc_deviation", 0.05))
+        )) if terminal_soc_max_deviations else 1.0,
+        "max_terminal_soc_deviation": float(max(terminal_soc_max_deviations, default=float("inf"))),
+        "mean_terminal_soc_rms_deviation": float(np.mean(terminal_soc_rms_deviations))
+        if terminal_soc_rms_deviations else float("inf"),
         "steps": float(step_count),
         "mean_voltage_rms_deviation_pu": float(np.mean(voltage_rms_deviations)) if voltage_rms_deviations else 0.0,
         "mean_gas_pressure_rms_deviation_bar": float(np.mean(gas_pressure_rms_deviations)) if gas_pressure_rms_deviations else 0.0,
@@ -3647,6 +3706,13 @@ def evaluate_policy(agents: AgentBundle, cfg: TrainConfig, episodes: int = 1, ma
         result[key + "_cost_total"] = float(total)
         result[key + "_cost_per_step"] = float(total / denom)
         result[key + "_violation_rate"] = float(component_violation_steps.get(key, 0) / denom)
+    # Component activity is logged per fast step, whereas terminal-SOC feasibility
+    # is an episode-level contract.  Restore the episode-level definition after the
+    # generic component loop so a single terminal event is not diluted by 480 steps.
+    result["terminal_soc_violation_rate"] = float(np.mean(
+        np.asarray(terminal_soc_max_deviations, dtype=float)
+        > float(getattr(cfg, "max_terminal_soc_deviation", 0.05))
+    )) if terminal_soc_max_deviations else 1.0
     feasible, feasibility_reasons = is_feasible(result, cfg)
     result["constraint_feasibility"] = float(feasible)
     result["feasibility_reasons"] = feasibility_reasons
